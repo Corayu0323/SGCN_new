@@ -30,9 +30,12 @@ _SGCN_MIN_TRAIN_NODES = 32
 # Number of validation nodes sampled for the per-subgraph quality score
 _SGCN_VAL_SAMPLE_SIZE = 512
 
-def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
+def _sample_subgraph_nodes(edge_index, n_nodes, train_idx, method, n_sample,
                            subgraph_max_nodes=None, unsampled_nodes=None):
     """Return a 1-D sorted LongTensor of sampled node indices.
+
+    All returned tensors live on the same device as *edge_index*, enabling
+    fully GPU-resident sampling when called with CUDA tensors.
 
     Supported methods
     -----------------
@@ -52,6 +55,9 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
         subgraphs collectively covers the whole graph before revisiting
         already-sampled regions.
     """
+    # All tensor ops run on the same device as edge_index (CPU or CUDA).
+    device = edge_index.device
+
     # subgraph_max_nodes takes priority over the ratio-derived n_sample.
     if subgraph_max_nodes is not None and subgraph_max_nodes > 0:
         n_sample = subgraph_max_nodes
@@ -67,18 +73,18 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
             n_priority = len(unsampled_nodes)
             if n_priority >= n_sample:
                 # Enough unsampled nodes to fill the quota entirely.
-                perm = torch.randperm(n_priority)[:n_sample]
+                perm = torch.randperm(n_priority, device=device)[:n_sample]
                 return unsampled_nodes[perm].sort().values
             else:
                 # Take all unsampled nodes, then fill remainder from the rest.
                 remaining = n_sample - n_priority
-                sampled_mask = torch.ones(n_nodes, dtype=torch.bool)
+                sampled_mask = torch.ones(n_nodes, dtype=torch.bool, device=device)
                 sampled_mask[unsampled_nodes] = False
                 sampled_pool = sampled_mask.nonzero(as_tuple=False).squeeze(1)
-                perm = torch.randperm(len(sampled_pool))[:remaining]
+                perm = torch.randperm(len(sampled_pool), device=device)[:remaining]
                 return torch.cat([unsampled_nodes,
                                   sampled_pool[perm]]).sort().values
-        perm = torch.randperm(n_nodes)[:n_sample]
+        perm = torch.randperm(n_nodes, device=device)[:n_sample]
         return perm.sort().values
 
     elif method == 'random_edge':
@@ -86,28 +92,28 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
         if has_priority:
             # Build a boolean mask of priority nodes, then select edges that
             # touch at least one priority node first.
-            prio_mask = torch.zeros(n_nodes, dtype=torch.bool)
+            prio_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
             prio_mask[unsampled_nodes] = True
             edge_has_prio = prio_mask[edge_index[0]] | prio_mask[edge_index[1]]
             prio_edges  = edge_has_prio.nonzero(as_tuple=False).squeeze(1)
             other_edges = (~edge_has_prio).nonzero(as_tuple=False).squeeze(1)
 
             n_prio_sample = min(n_sample * 2, len(prio_edges))
-            perm_p  = torch.randperm(len(prio_edges))[:n_prio_sample]
+            perm_p  = torch.randperm(len(prio_edges), device=device)[:n_prio_sample]
             chosen  = edge_index[:, prio_edges[perm_p]].flatten().unique()
 
             if len(chosen) < n_sample and len(other_edges) > 0:
                 extra_e = other_edges[
-                    torch.randperm(len(other_edges))[:n_sample * 2]
+                    torch.randperm(len(other_edges), device=device)[:n_sample * 2]
                 ]
                 extra_n = edge_index[:, extra_e].flatten().unique()
                 chosen  = torch.cat([chosen, extra_n]).unique()
         else:
-            edge_perm = torch.randperm(n_edges)[:min(n_sample * 2, n_edges)]
+            edge_perm = torch.randperm(n_edges, device=device)[:min(n_sample * 2, n_edges)]
             chosen    = edge_index[:, edge_perm].flatten().unique()
 
         if len(chosen) < n_sample:
-            extra = torch.randperm(n_nodes)[:n_sample - len(chosen)]
+            extra = torch.randperm(n_nodes, device=device)[:n_sample - len(chosen)]
             chosen = torch.cat([chosen, extra]).unique()
         return chosen[:n_sample].sort().values
 
@@ -115,7 +121,7 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
         # Build the seed pool: prefer training nodes inside unsampled regions.
         if has_priority:
             prio_train = unsampled_nodes[
-                torch.isin(unsampled_nodes, train_idx_cpu)
+                torch.isin(unsampled_nodes, train_idx)
             ]
             if len(prio_train) > 0:
                 seed_pool = prio_train
@@ -123,13 +129,13 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
                 # Fall back to any unsampled node as seeds.
                 seed_pool = unsampled_nodes
         else:
-            seed_pool = train_idx_cpu
+            seed_pool = train_idx
 
         n_seeds   = min(max(n_sample // _SGCN_SEED_RATIO, 1), len(seed_pool))
-        seed_perm = torch.randperm(len(seed_pool))[:n_seeds]
+        seed_perm = torch.randperm(len(seed_pool), device=device)[:n_seeds]
         seeds     = seed_pool[seed_perm]
 
-        visited = torch.zeros(n_nodes, dtype=torch.bool)
+        visited = torch.zeros(n_nodes, dtype=torch.bool, device=device)
         visited[seeds] = True
 
         row, col  = edge_index
@@ -145,11 +151,11 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
         visited_nodes = visited.nonzero(as_tuple=False).squeeze(1)
 
         if len(visited_nodes) > n_sample:
-            perm = torch.randperm(len(visited_nodes))[:n_sample]
+            perm = torch.randperm(len(visited_nodes), device=device)[:n_sample]
             return visited_nodes[perm].sort().values
         elif len(visited_nodes) < n_sample:
             unvisited  = (~visited).nonzero(as_tuple=False).squeeze(1)
-            extra_perm = torch.randperm(len(unvisited))[:n_sample - len(visited_nodes)]
+            extra_perm = torch.randperm(len(unvisited), device=device)[:n_sample - len(visited_nodes)]
             return torch.cat([visited_nodes, unvisited[extra_perm]]).sort().values
 
         return visited_nodes.sort().values
@@ -172,7 +178,9 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                      truncation_ratio=0.2,
                      aggregation_method='sgcn',
                      use_labels=False, n_classes=112,
-                     debug_subgraph_stats=False):
+                     debug_subgraph_stats=False,
+                     x_full_dev=None, y_full_dev=None,
+                     edge_index_dev=None, edge_attr_dev=None):
     """SGCN training epoch with subgraph sampling, local multi-epoch training,
     and configurable aggregation.
 
@@ -274,15 +282,28 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     """
     model.train()
 
-    train_idx_cpu = train_idx.cpu()
-    val_idx_cpu   = val_idx.cpu()
+    # ── Ensure full-graph tensors are GPU-resident for SGCN subgraph ops.
+    # When pre-built by run(), these are reused across all epochs with zero
+    # extra host→device copy.  Fall back to on-demand transfer if not supplied.
+    if edge_index_dev is None:
+        edge_index_dev = data.edge_index.to(device)
+    if x_full_dev is None:
+        x_full_dev = data.x.to(device)
+    if y_full_dev is None:
+        y_full_dev = data.y.to(device)
+    if edge_attr_dev is None and data.edge_attr is not None:
+        edge_attr_dev = data.edge_attr.to(device)
+
+    # Move split indices to device so all isin/randperm ops stay on GPU.
+    train_idx_dev = train_idx.to(device)
+    val_idx_dev   = val_idx.to(device)
+
     n_nodes       = data.num_nodes
     # subgraph_max_nodes takes priority; fall back to ratio-based size.
     if subgraph_max_nodes is not None and subgraph_max_nodes > 0:
         n_sample = subgraph_max_nodes
     else:
         n_sample = max(1, int(n_nodes * subgraph_ratio))
-    edge_index_cpu = data.edge_index.cpu()
 
     # Auto-derive n_subgraphs when not explicitly set so that the product
     # n_subgraphs × n_sample >= n_nodes (full-graph coverage guarantee).
@@ -294,14 +315,15 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     # Snapshot of model parameters at the start of this epoch.  Every local
     # subgraph model is initialised from this state so that aggregation is
     # well-defined and subgraphs are fully independent of each other.
-    epoch_init_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
+    # Kept on GPU to avoid PCIe round-trips on every subgraph reset.
+    epoch_init_state = {k: v.clone() for k, v in model.state_dict().items()}
 
     local_states  = []
     val_scores    = []
     loss_sum      = 0.0
     valid_batches = 0
 
-    val_sample_size = min(_SGCN_VAL_SAMPLE_SIZE, len(val_idx_cpu))
+    val_sample_size = min(_SGCN_VAL_SAMPLE_SIZE, len(val_idx_dev))
 
     # Per-subgraph timing lists (index r corresponds to subgraph r).
     subgraph_sampling_times = []
@@ -312,7 +334,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     # least one subgraph so far.  Unsampled nodes are fed as a priority pool
     # to each successive sampler, ensuring the sequence of subgraphs covers
     # the entire graph before revisiting already-sampled regions.
-    epoch_sampled_mask = torch.zeros(n_nodes, dtype=torch.bool)
+    # Kept on GPU so nonzero() and indexing stay device-local.
+    epoch_sampled_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
 
     for _sg in range(n_subgraphs):
         # ── 1. Sample subgraph node indices ─────────────────────────────────
@@ -327,15 +350,15 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
             unsampled_nodes = None
 
         node_idx  = _sample_subgraph_nodes(
-            edge_index_cpu, n_nodes, train_idx_cpu, subsampling_method, n_sample,
+            edge_index_dev, n_nodes, train_idx_dev, subsampling_method, n_sample,
             subgraph_max_nodes=subgraph_max_nodes,
             unsampled_nodes=unsampled_nodes,
         )
 
         # Guarantee at least a few training nodes are included.
-        if not torch.isin(node_idx, train_idx_cpu).any():
-            extra    = train_idx_cpu[
-                torch.randperm(len(train_idx_cpu))[:min(_SGCN_MIN_TRAIN_NODES, len(train_idx_cpu))]
+        if not torch.isin(node_idx, train_idx_dev).any():
+            extra    = train_idx_dev[
+                torch.randperm(len(train_idx_dev), device=device)[:min(_SGCN_MIN_TRAIN_NODES, len(train_idx_dev))]
             ]
             node_idx = torch.cat([node_idx, extra]).unique()
             node_idx = node_idx.sort().values
@@ -344,33 +367,42 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         # subsequent subgraphs are biased toward the still-uncovered region.
         epoch_sampled_mask[node_idx] = True
 
-        # ── 2. Extract induced subgraph ──────────────────────────────────────
-        edge_index_sub, edge_attr_sub = pyg_subgraph(
-            node_idx,
-            data.edge_index,
-            data.edge_attr,
-            relabel_nodes=True,
-            num_nodes=n_nodes,
-        )
+        # ── 2. Build induced subgraph on GPU ─────────────────────────────────
+        # Constructing the subgraph directly on GPU avoids the CPU pyg_subgraph
+        # round-trip (host↔device copy) that was the main CPU bottleneck.
+        in_subgraph_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+        in_subgraph_mask[node_idx] = True
+        src = edge_index_dev[0]
+        dst = edge_index_dev[1]
+        edge_keep = in_subgraph_mask[src] & in_subgraph_mask[dst]
+        edge_index_sub_global = edge_index_dev[:, edge_keep]
+        edge_attr_sub = edge_attr_dev[edge_keep] if edge_attr_dev is not None else None
+        del in_subgraph_mask
 
         # ── 2a. Enforce hard edge-count cap ─────────────────────────────────
         if max_subgraph_edges is not None and max_subgraph_edges > 0:
-            n_edges_sub = edge_index_sub.size(1)
+            n_edges_sub = edge_index_sub_global.size(1)
             if n_edges_sub > max_subgraph_edges:
-                perm          = torch.randperm(n_edges_sub)[:max_subgraph_edges]
-                edge_index_sub = edge_index_sub[:, perm]
+                perm           = torch.randperm(n_edges_sub, device=device)[:max_subgraph_edges]
+                edge_index_sub_global = edge_index_sub_global[:, perm]
                 if edge_attr_sub is not None:
                     edge_attr_sub = edge_attr_sub[perm]
+
+        # Relabel global node ids to contiguous local ids (all on GPU).
+        global_to_local = torch.full((n_nodes,), -1, dtype=torch.long, device=device)
+        global_to_local[node_idx] = torch.arange(len(node_idx), device=device)
+        edge_index_sub = global_to_local[edge_index_sub_global]
+        del global_to_local, edge_index_sub_global
+
+        x_sub  = x_full_dev[node_idx]
+        y_sub  = y_full_dev[node_idx]
+        ei_sub = edge_index_sub
+        ea_sub = edge_attr_sub
 
         _cuda_sync(device)
         subgraph_sampling_times.append(time.time() - t_sample_start)
 
-        x_sub  = data.x[node_idx].to(device)
-        y_sub  = data.y[node_idx].to(device)
-        ei_sub = edge_index_sub.to(device)
-        ea_sub = edge_attr_sub.to(device) if edge_attr_sub is not None else None
-
-        train_mask = torch.isin(node_idx, train_idx_cpu)
+        train_mask = torch.isin(node_idx, train_idx_dev)
         if not train_mask.any():
             del x_sub, y_sub, ei_sub, ea_sub
             # Record zero train/eval times; sampling time is preserved.
@@ -381,7 +413,9 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         if use_labels:
             non_train_local = torch.where(~train_mask)[0]
             x_sub = add_labels(
-                x_sub, data.train_labels_onehot, non_train_local, n_classes, device
+                # non_train_local is a GPU tensor; move to CPU to index the
+                # CPU-resident train_labels_onehot without a device mismatch.
+                x_sub, data.train_labels_onehot, non_train_local.cpu(), n_classes, device
             )
 
         # ── Debug: print subgraph stats before forward pass ─────────────────
@@ -405,7 +439,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         # subgraphs are fully independent and their trained states are
         # comparable for aggregation.  Clearing the optimizer state ensures
         # accumulated momentum from previous subgraphs does not bleed through.
-        model.load_state_dict({k: v.to(device) for k, v in epoch_init_state.items()})
+        # epoch_init_state is already on GPU, so no .to(device) transfer needed.
+        model.load_state_dict(epoch_init_state)
         optimizer.state.clear()
         model.train()
 
@@ -413,7 +448,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         # All local_epochs steps use the same subgraph – no re-sampling.
         _cuda_sync(device)
         t_train_start  = time.time()
-        train_mask_dev = train_mask.to(device)
+        # train_mask is already on device (computed from GPU node_idx/train_idx).
+        train_mask_dev = train_mask
         last_loss      = 0.0
 
         for _le in range(local_epochs):
@@ -444,46 +480,51 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
         model.eval()
         with torch.no_grad():
-            val_sample  = val_idx_cpu[
-                torch.randperm(len(val_idx_cpu))[:val_sample_size]
+            val_sample  = val_idx_dev[
+                torch.randperm(len(val_idx_dev), device=device)[:val_sample_size]
             ]
             # Augment subgraph with val nodes so GCN can aggregate their
             # neighborhood context without leaking their labels.
             eval_node_idx = torch.cat([node_idx, val_sample]).unique()
             eval_node_idx = eval_node_idx.sort().values
 
-            ei_eval, ea_eval = pyg_subgraph(
-                eval_node_idx,
-                data.edge_index,
-                data.edge_attr,
-                relabel_nodes=True,
-                num_nodes=n_nodes,
-            )
+            # Build eval subgraph on GPU – same approach as training subgraph.
+            in_eval_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+            in_eval_mask[eval_node_idx] = True
+            edge_keep_eval = in_eval_mask[edge_index_dev[0]] & in_eval_mask[edge_index_dev[1]]
+            ei_eval_global = edge_index_dev[:, edge_keep_eval]
+            ea_eval = edge_attr_dev[edge_keep_eval] if edge_attr_dev is not None else None
+            del in_eval_mask
 
             # Apply the same edge cap to the eval subgraph.
             if max_subgraph_edges is not None and max_subgraph_edges > 0:
-                n_edges_eval = ei_eval.size(1)
+                n_edges_eval = ei_eval_global.size(1)
                 if n_edges_eval > max_subgraph_edges:
-                    perm_eval = torch.randperm(n_edges_eval)[:max_subgraph_edges]
-                    ei_eval   = ei_eval[:, perm_eval]
+                    perm_eval      = torch.randperm(n_edges_eval, device=device)[:max_subgraph_edges]
+                    ei_eval_global = ei_eval_global[:, perm_eval]
                     if ea_eval is not None:
                         ea_eval = ea_eval[perm_eval]
 
-            x_eval  = data.x[eval_node_idx].to(device)
-            y_eval  = data.y[eval_node_idx].to(device)
-            ei_eval = ei_eval.to(device)
-            ea_eval = ea_eval.to(device) if ea_eval is not None else None
+            # Relabel to contiguous local ids (GPU).
+            g2l_eval = torch.full((n_nodes,), -1, dtype=torch.long, device=device)
+            g2l_eval[eval_node_idx] = torch.arange(len(eval_node_idx), device=device)
+            ei_eval = g2l_eval[ei_eval_global]
+            del g2l_eval, ei_eval_global
+
+            x_eval  = x_full_dev[eval_node_idx]
+            y_eval  = y_full_dev[eval_node_idx]
 
             if use_labels:
-                eval_train_mask = torch.isin(eval_node_idx, train_idx_cpu)
+                eval_train_mask = torch.isin(eval_node_idx, train_idx_dev)
                 non_train_eval  = torch.where(~eval_train_mask)[0]
                 x_eval = add_labels(
                     x_eval, data.train_labels_onehot,
-                    non_train_eval, n_classes, device
+                    non_train_eval.cpu(), n_classes, device
                 )
 
             pred_eval      = model(x_eval, ei_eval, ea_eval)
-            val_local_mask = torch.isin(eval_node_idx, val_sample).to(device)
+            # val_sample and eval_node_idx are both on device; no .to(device) needed.
+            val_local_mask = torch.isin(eval_node_idx, val_sample)
             val_loss = criterion(
                 pred_eval[val_local_mask], y_eval[val_local_mask].float()
             )
@@ -495,8 +536,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         _cuda_sync(device)
         subgraph_eval_times.append(time.time() - t_eval_start)
 
-        # Save local state dict on CPU to avoid multi-copy GPU residency.
-        local_states.append({k: v.clone().cpu() for k, v in model.state_dict().items()})
+        # Save local state dict on GPU; aggregation will run fully on device.
+        local_states.append({k: v.clone() for k, v in model.state_dict().items()})
         val_scores.append(val_score)
 
         # Release per-subgraph GPU tensors.
@@ -519,7 +560,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
     # ── Fallback if no valid subgraph was processed ──────────────────────────
     if not local_states:
-        model.load_state_dict({k: v.to(device) for k, v in epoch_init_state.items()})
+        # epoch_init_state is already on GPU; load directly.
+        model.load_state_dict(epoch_init_state)
         extra_sgcn = {
             'local_epochs':               local_epochs,
             'max_subgraph_pipeline_time': 0.0,
@@ -542,11 +584,14 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     kept_idx   = sorted_idx[:n_keep]
 
     # ── 7. Aggregate local states according to aggregation_method ───────────
-    kept_scores = torch.tensor([val_scores[i] for i in kept_idx], dtype=torch.float)
+    # kept_scores and weights are created directly on device so the entire
+    # stacking/weighted-sum stays on GPU without extra PCIe transfers.
+    kept_scores = torch.tensor([val_scores[i] for i in kept_idx],
+                               dtype=torch.float, device=device)
 
     if aggregation_method == 'avg':
         # SGCN-Avg: uniform equal-weight average
-        weights = torch.ones(len(kept_idx), dtype=torch.float) / len(kept_idx)
+        weights = torch.ones(len(kept_idx), dtype=torch.float, device=device) / len(kept_idx)
     elif aggregation_method == 'weighted':
         # SGCN-Weighted: performance-based linear normalization.
         # Shift scores so the minimum becomes a small positive value, then
@@ -564,6 +609,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
     agg_state = {}
     for key in epoch_init_state:
+        # local_states entries are GPU tensors; stacking stays on device.
         stacked = torch.stack(
             [local_states[i][key].float() for i in kept_idx], dim=0
         )
@@ -571,7 +617,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         agg_state[key] = (stacked * w).sum(dim=0).to(epoch_init_state[key].dtype)
 
     # ── 8. Load aggregated state; clear stale optimiser momentum ────────────
-    model.load_state_dict({k: v.to(device) for k, v in agg_state.items()})
+    # agg_state tensors are already on device; no .to(device) map needed.
+    model.load_state_dict(agg_state)
     optimizer.state.clear()
 
     _cuda_sync(device)
@@ -829,6 +876,20 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     final_pred  = None
     epoch_records = []
 
+    # ── SGCN: pre-load full graph to GPU and keep resident for all epochs. ───
+    # Doing this once here avoids repeated host→device copies inside the inner
+    # subgraph loop, which was the primary cause of CPU-bound behaviour.
+    if mpnn == 'sgcn':
+        _sgcn_x_dev         = data.x.to(device)
+        _sgcn_y_dev         = data.y.to(device)
+        _sgcn_edge_index_dev = data.edge_index.to(device)
+        _sgcn_edge_attr_dev  = data.edge_attr.to(device) if data.edge_attr is not None else None
+        _sgcn_train_idx_dev  = train_idx.to(device)
+        _sgcn_val_idx_dev    = val_idx.to(device)
+    else:
+        _sgcn_x_dev = _sgcn_y_dev = _sgcn_edge_index_dev = _sgcn_edge_attr_dev = None
+        _sgcn_train_idx_dev = _sgcn_val_idx_dev = None
+
     _cuda_sync(device)
     run_start = time.time()
 
@@ -841,7 +902,7 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         elif mpnn == 'sgcn':
             loss, epoch_time, sampling_time, extra_sgcn = train_epoch_sgcn(
                 model, data, criterion, optimizer, device,
-                train_idx, val_idx,
+                _sgcn_train_idx_dev, _sgcn_val_idx_dev,
                 n_subgraphs=n_subgraphs,
                 local_epochs=local_epochs,
                 subsampling_method=subsampling_method,
@@ -851,6 +912,10 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 aggregation_method=aggregation_method,
                 use_labels=use_labels, n_classes=n_classes,
                 debug_subgraph_stats=debug_subgraph_stats,
+                x_full_dev=_sgcn_x_dev,
+                y_full_dev=_sgcn_y_dev,
+                edge_index_dev=_sgcn_edge_index_dev,
+                edge_attr_dev=_sgcn_edge_attr_dev,
             )
         else:
             loss, epoch_time, sampling_time = train_epoch(
