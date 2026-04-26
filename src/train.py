@@ -375,9 +375,9 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         src = edge_index_dev[0]
         dst = edge_index_dev[1]
         edge_keep = in_subgraph_mask[src] & in_subgraph_mask[dst]
+        del in_subgraph_mask
         edge_index_sub_global = edge_index_dev[:, edge_keep]
         edge_attr_sub = edge_attr_dev[edge_keep] if edge_attr_dev is not None else None
-        del in_subgraph_mask
 
         # ── 2a. Enforce hard edge-count cap ─────────────────────────────────
         if max_subgraph_edges is not None and max_subgraph_edges > 0:
@@ -392,7 +392,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         global_to_local = torch.full((n_nodes,), -1, dtype=torch.long, device=device)
         global_to_local[node_idx] = torch.arange(len(node_idx), device=device)
         edge_index_sub = global_to_local[edge_index_sub_global]
-        del global_to_local, edge_index_sub_global
+        del global_to_local
+        del edge_index_sub_global
 
         x_sub  = x_full_dev[node_idx]
         y_sub  = y_full_dev[node_idx]
@@ -492,9 +493,9 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
             in_eval_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
             in_eval_mask[eval_node_idx] = True
             edge_keep_eval = in_eval_mask[edge_index_dev[0]] & in_eval_mask[edge_index_dev[1]]
+            del in_eval_mask
             ei_eval_global = edge_index_dev[:, edge_keep_eval]
             ea_eval = edge_attr_dev[edge_keep_eval] if edge_attr_dev is not None else None
-            del in_eval_mask
 
             # Apply the same edge cap to the eval subgraph.
             if max_subgraph_edges is not None and max_subgraph_edges > 0:
@@ -509,7 +510,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
             g2l_eval = torch.full((n_nodes,), -1, dtype=torch.long, device=device)
             g2l_eval[eval_node_idx] = torch.arange(len(eval_node_idx), device=device)
             ei_eval = g2l_eval[ei_eval_global]
-            del g2l_eval, ei_eval_global
+            del g2l_eval
+            del ei_eval_global
 
             x_eval  = x_full_dev[eval_node_idx]
             y_eval  = y_full_dev[eval_node_idx]
