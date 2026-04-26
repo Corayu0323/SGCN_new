@@ -1,0 +1,2 @@
+method,n_runs,mean_best_val_auc,std_best_val_auc,mean_best_test_auc,std_best_test_auc,mean_train_epoch_time,std_train_epoch_time,mean_eval_time,std_eval_time,mean_total_run_time,std_total_run_time
+sgcn,3,0.7113853215237939,0.008133347133153947,0.6357094813192182,0.011027537939602882,1.1073383979002636,0.0021811734289394025,2.390175700187683,0.012999137095571975,525.4537145296732,0.33395996729223043

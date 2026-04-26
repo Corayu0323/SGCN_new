@@ -1,0 +1,2 @@
+method,run_id,seed,best_val_auc,best_test_auc,final_val_auc,final_test_auc,mean_train_sampling_time,mean_train_epoch_time,mean_eval_time,total_run_time,local_epochs,mean_sgcn_epoch_time_max,mean_max_subgraph_pipeline_time,mean_aggregation_time
+sgcn,1,0,0.7772455569456665,0.7031720664679219,0.7772455569456665,0.7031720664679219,2.943200398683548,0.2345403265953064,2.9787111580371857,1700.2294070720673,3,0.2345403265953064,0.23111799836158753,0.003422328233718872

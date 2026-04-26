@@ -1,0 +1,18 @@
+config:
+  method: sgcn
+  dataset: ogbn-proteins
+  sampling_method: random_node
+  trunc_ratio: 0.2
+  local_epochs: 3
+  epochs: 200
+  lr: 0.01
+  hidden_dim: 64
+  seeds:
+  - 0
+meta:
+  timestamp: '20260426_165011'
+  git_commit: N/A
+  python_version: 3.10.12 (main, Jul  5 2023, 18:54:27) [GCC 11.2.0]
+  torch_version: !!python/object/new:torch.torch_version.TorchVersion
+  - 2.4.0+cu118
+  device: cuda:0
