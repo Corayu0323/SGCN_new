@@ -367,9 +367,9 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
         # Optional: pad subgraph to at least min_subgraph_nodes total nodes.
         if min_subgraph_nodes > 0 and len(node_idx) < min_subgraph_nodes:
-            target      = min(min_subgraph_nodes, n_nodes)
-            n_extra     = target - len(node_idx)
-            all_nodes   = torch.arange(n_nodes, device=device)
+            target_nodes   = min(min_subgraph_nodes, n_nodes)
+            n_extra        = target_nodes - len(node_idx)
+            all_nodes      = torch.arange(n_nodes, device=device)
             candidate_mask = torch.ones(n_nodes, dtype=torch.bool, device=device)
             candidate_mask[node_idx] = False
             candidates  = all_nodes[candidate_mask]
@@ -380,7 +380,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         # Guarantee at least min_train_nodes_in_subgraph training nodes are included.
         train_in_sub = torch.isin(node_idx, train_idx_dev).sum().item()
         if train_in_sub < min_train_nodes_in_subgraph:
-            n_need   = min_train_nodes_in_subgraph - int(train_in_sub)
+            n_need   = min_train_nodes_in_subgraph - train_in_sub
             extra    = train_idx_dev[
                 torch.randperm(len(train_idx_dev), device=device)[:min(n_need, len(train_idx_dev))]
             ]
