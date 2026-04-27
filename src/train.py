@@ -180,7 +180,9 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                      use_labels=False, n_classes=112,
                      debug_subgraph_stats=False,
                      x_full_dev=None, y_full_dev=None,
-                     edge_index_dev=None, edge_attr_dev=None):
+                     edge_index_dev=None, edge_attr_dev=None,
+                     min_subgraph_nodes=0,
+                     min_train_nodes_in_subgraph=_SGCN_MIN_TRAIN_NODES):
     """SGCN training epoch with subgraph sampling, local multi-epoch training,
     and configurable aggregation.
 
@@ -268,6 +270,14 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                                                 (SGCN-Weighted).
     debug_subgraph_stats : bool – when True, print per-subgraph shape and
                                    CUDA memory stats before each forward pass.
+    min_subgraph_nodes  : int  – if > 0, pad sampled subgraph to this many
+                                   nodes by drawing random graph nodes.
+                                   0 (default) disables padding.
+    min_train_nodes_in_subgraph : int – minimum training nodes that must be
+                                   present in a subgraph.  When the subgraph
+                                   contains fewer, random training nodes are
+                                   added to reach this threshold.
+                                   Default: _SGCN_MIN_TRAIN_NODES (32).
 
     Returns
     -------
@@ -355,13 +365,26 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
             unsampled_nodes=unsampled_nodes,
         )
 
-        # Guarantee at least a few training nodes are included.
-        if not torch.isin(node_idx, train_idx_dev).any():
+        # Optional: pad subgraph to at least min_subgraph_nodes total nodes.
+        if min_subgraph_nodes > 0 and len(node_idx) < min_subgraph_nodes:
+            target      = min(min_subgraph_nodes, n_nodes)
+            n_extra     = target - len(node_idx)
+            all_nodes   = torch.arange(n_nodes, device=device)
+            candidate_mask = torch.ones(n_nodes, dtype=torch.bool, device=device)
+            candidate_mask[node_idx] = False
+            candidates  = all_nodes[candidate_mask]
+            if len(candidates) > 0:
+                perm     = torch.randperm(len(candidates), device=device)[:n_extra]
+                node_idx = torch.cat([node_idx, candidates[perm]]).unique().sort().values
+
+        # Guarantee at least min_train_nodes_in_subgraph training nodes are included.
+        train_in_sub = torch.isin(node_idx, train_idx_dev).sum().item()
+        if train_in_sub < min_train_nodes_in_subgraph:
+            n_need   = min_train_nodes_in_subgraph - int(train_in_sub)
             extra    = train_idx_dev[
-                torch.randperm(len(train_idx_dev), device=device)[:min(_SGCN_MIN_TRAIN_NODES, len(train_idx_dev))]
+                torch.randperm(len(train_idx_dev), device=device)[:min(n_need, len(train_idx_dev))]
             ]
-            node_idx = torch.cat([node_idx, extra]).unique()
-            node_idx = node_idx.sort().values
+            node_idx = torch.cat([node_idx, extra]).unique().sort().values
 
         # Mark these nodes as covered for the remainder of this epoch so that
         # subsequent subgraphs are biased toward the still-uncovered region.
@@ -816,7 +839,9 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         local_epochs=5,
         subgraph_max_nodes=256,
         max_subgraph_edges=300000,
-        debug_subgraph_stats=False):
+        debug_subgraph_stats=False,
+        min_subgraph_nodes=0,
+        min_train_nodes_in_subgraph=_SGCN_MIN_TRAIN_NODES):
     evaluator_wrapper = lambda pred, lbls: evaluator.eval(
         {'y_pred': pred, 'y_true': lbls}
     )['rocauc']
@@ -918,6 +943,8 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 y_full_dev=_sgcn_y_dev,
                 edge_index_dev=_sgcn_edge_index_dev,
                 edge_attr_dev=_sgcn_edge_attr_dev,
+                min_subgraph_nodes=min_subgraph_nodes,
+                min_train_nodes_in_subgraph=min_train_nodes_in_subgraph,
             )
         else:
             loss, epoch_time, sampling_time = train_epoch(
