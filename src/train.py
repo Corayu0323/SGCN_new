@@ -716,6 +716,75 @@ def train_epoch(model, dataloader, criterion, optimizer, device,
     return loss_sum / total, epoch_time, sampling_time
 
 
+def train_epoch_fullbatch(model, x, edge_index, y, edge_attr, train_idx,
+                          criterion, optimizer, device,
+                          use_labels=False, n_classes=112,
+                          train_labels_onehot=None):
+    """Full-batch GCN training epoch.
+
+    A single forward/backward pass is performed over the entire graph.
+    Loss is computed only on training nodes.
+    """
+    model.train()
+
+    _cuda_sync(device)
+    epoch_start = time.time()
+
+    if use_labels:
+        n_nodes = x.shape[0]
+        train_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+        train_mask[train_idx] = True
+        non_train_idx_cpu = (~train_mask).nonzero(as_tuple=False).squeeze(1).cpu()
+        x = add_labels(x, train_labels_onehot, non_train_idx_cpu, n_classes, device)
+
+    pred = model(x, edge_index, edge_attr)
+    loss = criterion(pred[train_idx], y[train_idx].float())
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    _cuda_sync(device)
+    epoch_time = time.time() - epoch_start
+
+    return loss.item(), epoch_time, 0.0
+
+
+@torch.no_grad()
+def evaluate_fullbatch(model, x, edge_index, labels, edge_attr,
+                       train_idx, val_idx, test_idx,
+                       criterion, evaluator, device,
+                       use_labels=False, n_classes=112,
+                       train_labels_onehot=None):
+    """Full-batch evaluation over the entire graph."""
+    model.eval()
+
+    _cuda_sync(device)
+    eval_start = time.time()
+
+    if use_labels:
+        all_idx_cpu = torch.arange(x.shape[0])
+        x = add_labels(x, train_labels_onehot, all_idx_cpu, n_classes, device)
+
+    pred = model(x, edge_index, edge_attr)
+
+    _cuda_sync(device)
+    eval_time = time.time() - eval_start
+
+    train_loss = criterion(pred[train_idx], labels[train_idx].float()).item()
+    val_loss   = criterion(pred[val_idx],   labels[val_idx].float()).item()
+    test_loss  = criterion(pred[test_idx],  labels[test_idx].float()).item()
+
+    return (
+        evaluator(pred[train_idx], labels[train_idx]),
+        evaluator(pred[val_idx],   labels[val_idx]),
+        evaluator(pred[test_idx],  labels[test_idx]),
+        train_loss, val_loss, test_loss,
+        pred,
+        eval_time,
+    )
+
+
 def train_epoch_saint(model, dataloader, criterion, optimizer, device,
                       train_idx, use_labels=False, n_classes=112):
     """Training epoch using GraphSAINT subgraph-sampling batches.
@@ -872,6 +941,9 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         # SGCN handles its own subgraph sampling inside train_epoch_sgcn;
         # no external DataLoader is required.
         train_loader = None
+    elif mpnn == 'gcn':
+        # GCN uses full-batch training; no DataLoader is required.
+        train_loader = None
     else:
         train_loader = NeighborLoader(
             data,
@@ -882,14 +954,17 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             num_workers=4,
         )
 
-    eval_loader = NeighborLoader(
-        data,
-        num_neighbors=[32] * n_layers,
-        batch_size=32768,
-        input_nodes=torch.cat([train_idx.cpu(), val_idx.cpu(), test_idx.cpu()]),
-        shuffle=False,
-        num_workers=4,
-    )
+    if mpnn != 'gcn':
+        eval_loader = NeighborLoader(
+            data,
+            num_neighbors=[32] * n_layers,
+            batch_size=32768,
+            input_nodes=torch.cat([train_idx.cpu(), val_idx.cpu(), test_idx.cpu()]),
+            shuffle=False,
+            num_workers=4,
+        )
+    else:
+        eval_loader = None
 
     criterion    = nn.BCEWithLogitsLoss()
     model        = gen_model_fn().to(device)
@@ -916,6 +991,18 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     else:
         _sgcn_x_dev = _sgcn_y_dev = _sgcn_edge_index_dev = _sgcn_edge_attr_dev = None
         _sgcn_train_idx_dev = _sgcn_val_idx_dev = None
+
+    # ── GCN: pre-load full graph to GPU for full-batch training/evaluation. ──
+    if mpnn == 'gcn':
+        _gcn_x_dev          = data.x.to(device)
+        _gcn_edge_index_dev = data.edge_index.to(device)
+        _gcn_edge_attr_dev  = data.edge_attr.to(device) if data.edge_attr is not None else None
+        _gcn_train_idx_dev  = train_idx.to(device)
+        _gcn_val_idx_dev    = val_idx.to(device)
+        _gcn_test_idx_dev   = test_idx.to(device)
+    else:
+        _gcn_x_dev = _gcn_edge_index_dev = _gcn_edge_attr_dev = None
+        _gcn_train_idx_dev = _gcn_val_idx_dev = _gcn_test_idx_dev = None
 
     _cuda_sync(device)
     run_start = time.time()
@@ -945,6 +1032,13 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 edge_attr_dev=_sgcn_edge_attr_dev,
                 min_subgraph_nodes=min_subgraph_nodes,
                 min_train_nodes_in_subgraph=min_train_nodes_in_subgraph,
+            )
+        elif mpnn == 'gcn':
+            loss, epoch_time, sampling_time = train_epoch_fullbatch(
+                model, _gcn_x_dev, _gcn_edge_index_dev, labels, _gcn_edge_attr_dev,
+                _gcn_train_idx_dev, criterion, optimizer, device,
+                use_labels=use_labels, n_classes=n_classes,
+                train_labels_onehot=data.train_labels_onehot,
             )
         else:
             loss, epoch_time, sampling_time = train_epoch(
@@ -976,12 +1070,23 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             })
 
         if epoch == n_epochs or epoch % eval_every == 0 or epoch % log_every == 0:
-            (train_score, val_score, test_score,
-             train_loss, val_loss, test_loss,
-             pred, eval_time) = evaluate(
-                model, eval_loader, labels, train_idx, val_idx, test_idx,
-                criterion, evaluator_wrapper, device, use_labels, n_classes
-            )
+            if mpnn == 'gcn':
+                (train_score, val_score, test_score,
+                 train_loss, val_loss, test_loss,
+                 pred, eval_time) = evaluate_fullbatch(
+                    model, _gcn_x_dev, _gcn_edge_index_dev, labels, _gcn_edge_attr_dev,
+                    _gcn_train_idx_dev, _gcn_val_idx_dev, _gcn_test_idx_dev,
+                    criterion, evaluator_wrapper, device,
+                    use_labels=use_labels, n_classes=n_classes,
+                    train_labels_onehot=data.train_labels_onehot,
+                )
+            else:
+                (train_score, val_score, test_score,
+                 train_loss, val_loss, test_loss,
+                 pred, eval_time) = evaluate(
+                    model, eval_loader, labels, train_idx, val_idx, test_idx,
+                    criterion, evaluator_wrapper, device, use_labels, n_classes
+                )
 
             record['val_auc']   = val_score
             record['test_auc']  = test_score
