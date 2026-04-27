@@ -763,7 +763,7 @@ def evaluate_fullbatch(model, x, edge_index, labels, edge_attr,
     eval_start = time.time()
 
     if use_labels:
-        all_idx_cpu = torch.arange(x.shape[0])
+        all_idx_cpu = torch.arange(x.shape[0])  # CPU tensor; train_labels_onehot is CPU-resident
         x = add_labels(x, train_labels_onehot, all_idx_cpu, n_classes, device)
 
     pred = model(x, edge_index, edge_attr)
