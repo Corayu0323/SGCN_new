@@ -363,7 +363,8 @@ def train_epoch_sage(model, data, criterion, optimizer, device,
                      use_labels=False, n_classes=112,
                      x_dev=None, y_dev=None,
                      edge_index_dev=None, edge_attr_dev=None,
-                     row_ptr_dev=None, col_dev=None):
+                     row_ptr_dev=None, col_dev=None,
+                     train_labels_onehot_dev=None):
     """GraphSAGE training epoch with manual neighbour sampling and layer-wise
     aggregation – without NeighborLoader or any PyG DataLoader.
 
@@ -403,6 +404,10 @@ def train_epoch_sage(model, data, criterion, optimizer, device,
                       (SAGEConv does not use edge attributes).
     row_ptr_dev,
     col_dev         : Pre-built CSR adjacency on *device*.
+    train_labels_onehot_dev : GPU-resident one-hot label matrix, shape
+                      (n_nodes, n_classes).  Pre-loading this once avoids
+                      repeated host→device transfers per mini-batch.  If
+                      None, the CPU copy from *data* is used (slower).
 
     Returns
     -------
