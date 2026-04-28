@@ -48,6 +48,71 @@ class GNN_PyG(nn.Module):
         self.dropout     = nn.Dropout(dropout)
         self.activation  = activation
 
+    def forward_layerwise(self, x_B0, bipartite_edges, sizes):
+        """Layer-wise forward pass for GraphSAGE mini-batch training.
+
+        Implements the per-layer aggregation described in Algorithm 2 of
+        Hamilton et al. (2017) "Inductive Representation Learning on Large
+        Graphs".  At layer l, SAGEConv aggregates from B_l (source set)
+        to B_{l+1} (target set), where B_{l+1} always occupies the FIRST
+        ``sizes[l+1]`` positions in B_l.
+
+        Parameters
+        ----------
+        x_B0 : Tensor, shape (n_B0, in_feats)
+            Node features for all nodes in B_0 (the outermost hop set).
+        bipartite_edges : list[Tensor]
+            Per-layer bipartite edge indices.  bipartite_edges[l] has shape
+            (2, n_edges_l) with source local indices in [0, sizes[l]) and
+            target local indices in [0, sizes[l+1]).
+        sizes : list[int]
+            sizes[l] = |B_l|, length = n_layers + 1.
+
+        Returns
+        -------
+        Tensor, shape (n_seeds, n_classes)  where n_seeds = sizes[-1].
+        """
+        h = self.node_encoder(x_B0)
+        h = F.relu(h)
+        h = self.input_drop(h)
+
+        h_last = None
+        h_local = []
+
+        for i, (ei, n_tgt) in enumerate(zip(bipartite_edges, sizes[1:])):
+            n_src = h.shape[0]  # |B_i|
+
+            # Edge drop for regularisation (same convention as forward()).
+            if self.training and self.edge_drop > 0 and ei.shape[1] > 0:
+                mask = torch.rand(ei.shape[1], device=ei.device) >= self.edge_drop
+                ei = ei[:, mask]
+
+            # SAGEConv bipartite call: x = (source_feats, target_feats).
+            # B_{i+1} occupies the first n_tgt rows of B_i, so target
+            # features are simply h[:n_tgt].
+            # Corresponds to the AGGREGATE + COMBINE steps in
+            # Hamilton et al. 2017 Algorithm 2, line 4.
+            h = self.convs[i]((h, h[:n_tgt]), ei, size=(n_src, n_tgt))
+
+            # Skip connection from the previous layer's raw conv output
+            # (mirrors the residual logic in forward()).
+            if h_last is not None:
+                h = h + h_last[:h.shape[0], :]
+            h_last = h
+
+            h = self.norms[i](h)
+            h = self.activation(h)
+            h = self.dropout(h)
+            h_local.append(h)
+
+        if self.jk:
+            # Jump Knowledge: sum layer contributions; trim each to seed size.
+            n_seeds = sizes[-1]
+            h_local = [t[:n_seeds, :] for t in h_local]
+            h = torch.sum(torch.stack(h_local), dim=0)
+
+        return self.pred_linear(h)
+
     def forward(self, x, edge_index, edge_attr=None):
         # Random edge drop during training
         if self.training and self.edge_drop > 0 and edge_index.shape[1] > 0:

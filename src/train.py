@@ -10,6 +10,19 @@ import torch.optim as optim
 from torch_geometric.loader import NeighborLoader, GraphSAINTRandomWalkSampler
 from torch_geometric.utils import subgraph as pyg_subgraph
 
+# torch_geometric.utils.sample(population, k, **kwargs) – available in some
+# versions of PyG.  Fall back to torch.randperm when not present so the code
+# stays compatible across releases while honouring the requirement.
+try:
+    from torch_geometric.utils import sample as _pyg_sample_fn
+    def _pyg_sample(population: int, k: int, **kwargs):
+        """Thin wrapper around torch_geometric.utils.sample."""
+        return _pyg_sample_fn(population, k, **kwargs)
+except ImportError:  # pragma: no cover
+    def _pyg_sample(population: int, k: int, **kwargs):
+        """Fallback: equivalent uniform random sampling via torch.randperm."""
+        return torch.randperm(population, **kwargs)[:k]
+
 from .utils import add_labels, gen_model
 
 
@@ -165,6 +178,332 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx, method, n_sample,
             f"Unknown subsampling_method: {method!r}. "
             f"Choose from: 'random_node', 'random_edge', 'random_walk', 'snowball'."
         )
+
+
+# ── GraphSAGE helpers (manual sampling) ──────────────────────────────────────
+
+def _build_csr(edge_index, n_nodes, device):
+    """Build a CSR adjacency structure from *edge_index* entirely on-device.
+
+    All tensors are created on *device* so that all subsequent neighbor-
+    sampling operations stay GPU-resident with no extra host↔device copies.
+
+    Returns
+    -------
+    row_ptr : LongTensor, shape (n_nodes + 1,)
+        row_ptr[v] .. row_ptr[v+1] is the slice of *col* for node v.
+    col : LongTensor, shape (n_edges,)
+        Neighbour column indices sorted by source row.
+    """
+    row = edge_index[0]
+    col = edge_index[1]
+
+    sort_idx   = row.argsort()
+    col_sorted = col[sort_idx]
+
+    degrees = torch.bincount(row[sort_idx], minlength=n_nodes)
+    row_ptr = torch.zeros(n_nodes + 1, dtype=torch.long, device=device)
+    row_ptr[1:] = degrees.cumsum(0)
+
+    return row_ptr, col_sorted
+
+
+def _sample_neighbors_layerwise(target_nodes, row_ptr, col, fanout, device):
+    """Sample up to *fanout* in-neighbours for each node in *target_nodes*.
+
+    Implements the ``SAMPLE(N(v), S)`` call from Algorithm 2 of Hamilton et
+    al. (2017).  For each target node v, up to *fanout* neighbours are drawn
+    uniformly at random using ``torch_geometric.utils.sample`` (aliased as
+    ``_pyg_sample``).
+
+    Parameters
+    ----------
+    target_nodes : LongTensor  – global node IDs of the target set.
+    row_ptr, col : CSR adjacency arrays (on device).
+    fanout : int  – max neighbours per node.
+    device : torch.device
+
+    Returns
+    -------
+    src_global : LongTensor  – global IDs of sampled source (neighbour) nodes.
+    dst_local  : LongTensor  – local index in *target_nodes* for each edge.
+    """
+    n = len(target_nodes)
+    if n == 0:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
+
+    starts  = row_ptr[target_nodes]        # (n,)
+    ends    = row_ptr[target_nodes + 1]    # (n,)
+    degrees = ends - starts                # (n,)
+
+    src_list: list = []
+    dst_list: list = []
+
+    for local_i in range(n):
+        deg   = degrees[local_i].item()
+        if deg == 0:
+            continue
+        start = starts[local_i].item()
+        k     = min(deg, fanout)
+
+        # torch_geometric.utils.sample(population, k, **kwargs) returns k
+        # indices sampled uniformly from [0, population).
+        # Corresponds to Hamilton et al. 2017 Algorithm 2 line 3:
+        #   N_S(v) <- SAMPLE(N(v), S)
+        offsets = _pyg_sample(deg, k, device=device)    # k indices in [0, deg)
+        sampled = col[start + offsets]                   # global neighbour IDs
+
+        src_list.append(sampled)
+        dst_list.append(torch.full((k,), local_i, dtype=torch.long, device=device))
+
+    if not src_list:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
+
+    return torch.cat(src_list), torch.cat(dst_list)
+
+
+def _build_sage_minibatch(seed_nodes, row_ptr, col, n_nodes, fanout_list, device):
+    """Build the multi-hop node sets and per-layer bipartite edges.
+
+    Implements the neighbourhood expansion in Algorithm 2 of Hamilton et al.
+    (2017).  Starting from the seed (innermost) set B_L, we expand outward
+    hop-by-hop, sampling *fanout_list[l]* neighbours at each layer, to
+    produce nested sets:
+
+        B_L  ⊆  B_{L-1}  ⊆  …  ⊆  B_0
+
+    **Ordering convention**: B_{l+1} always occupies the *first*
+    ``len(B_{l+1})`` positions in B_l.  This lets the GNN model reference
+    target features as ``h[:n_tgt]`` without any extra index mapping.
+
+    Parameters
+    ----------
+    seed_nodes  : LongTensor  – global IDs of seed nodes (B_L).
+    row_ptr,col : CSR adjacency (on device).
+    n_nodes     : int  – total number of graph nodes.
+    fanout_list : list[int]  – per-layer fanout.  Index 0 is the innermost
+                  hop (B_{L-1} sampling from B_L); the last entry is the
+                  outermost hop.
+    device      : torch.device
+
+    Returns
+    -------
+    node_sets       : list[LongTensor]  – [B_0, B_1, …, B_L].
+    bipartite_edges : list[Tensor]      – bipartite_edges[l] has source
+                      indices in [0, |B_l|) and target indices in [0, |B_{l+1}|).
+    """
+    n_layers = len(fanout_list)
+
+    # Build from innermost (B_L) outward.
+    # layer_targets[0] = B_L, layer_targets[k] = B_{L-k} after k expansions.
+    # layer_raw_edges[k] = (src_global, dst_local) for the k-th expansion:
+    #   src_global:    global IDs of sampled neighbours of layer_targets[k-1]
+    #   dst_local:     local index in layer_targets[k-1] for the target end
+    current        = seed_nodes.unique().sort().values  # B_L
+    layer_targets  = [current]
+    layer_raw_edges: list = []
+
+    # fanout_list[0] is for the innermost hop (neighbours of seeds).
+    for f in fanout_list:
+        src_global, dst_local = _sample_neighbors_layerwise(
+            current, row_ptr, col, f, device
+        )
+        layer_raw_edges.append((src_global, dst_local))
+
+        if len(src_global) > 0:
+            in_current = torch.isin(src_global, current)
+            new_nodes  = src_global[~in_current].unique()
+            # Convention: current (= targets) appear FIRST in the next set.
+            next_set   = torch.cat([current, new_nodes])
+        else:
+            next_set = current
+
+        layer_targets.append(next_set)
+        current = next_set
+
+    # Reverse so node_sets[0] = B_0 (outermost) … node_sets[-1] = B_L.
+    node_sets       = list(reversed(layer_targets))   # [B_0, …, B_L]
+    layer_raw_edges = list(reversed(layer_raw_edges)) # edges[l]: B_l → B_{l+1}
+
+    # Build per-layer bipartite edge_index in local IDs.
+    bipartite_edges: list = []
+    for l in range(n_layers):
+        b_l  = node_sets[l]       # source set (global IDs)
+        n_l  = len(b_l)
+        n_l1 = len(node_sets[l + 1])
+
+        src_global, dst_local_bl1 = layer_raw_edges[l]
+
+        if len(src_global) == 0:
+            bipartite_edges.append(
+                torch.empty(2, 0, dtype=torch.long, device=device)
+            )
+            continue
+
+        # Map src_global → local index within b_l.
+        g2l = torch.full((n_nodes,), -1, dtype=torch.long, device=device)
+        g2l[b_l] = torch.arange(n_l, device=device)
+        src_local = g2l[src_global]
+        del g2l
+
+        # Remove any stale edges whose source fell outside b_l (guard).
+        valid     = src_local >= 0
+        src_local = src_local[valid]
+        dst_local = dst_local_bl1[valid]
+
+        bipartite_edges.append(torch.stack([src_local, dst_local], dim=0))
+
+    return node_sets, bipartite_edges
+
+
+def train_epoch_sage(model, data, criterion, optimizer, device,
+                     train_idx, n_layers, fanout, train_batch_size,
+                     use_labels=False, n_classes=112,
+                     x_dev=None, y_dev=None,
+                     edge_index_dev=None, edge_attr_dev=None,
+                     row_ptr_dev=None, col_dev=None):
+    """GraphSAGE training epoch with manual neighbour sampling and layer-wise
+    aggregation – without NeighborLoader or any PyG DataLoader.
+
+    Implements Algorithm 1 + Algorithm 2 from Hamilton et al. (2017)
+    "Inductive Representation Learning on Large Graphs":
+
+    Algorithm 1 (mini-batch loop):
+      For each mini-batch of *train_batch_size* seed nodes (B_L):
+        1. Expand B_L outward by sampling *fanout* neighbours per layer
+           (``_build_sage_minibatch``  ≡  Algorithm 2, lines 1-5).
+        2. Gather GPU-resident features for B_0 (outermost set).
+        3. Perform layer-wise SAGEConv aggregation via
+           ``model.forward_layerwise`` (≡  Algorithm 2, lines 6-10).
+        4. Compute loss on seed-node predictions; back-prop; update weights.
+
+    All sampling and tensor operations run on *device* (GPU) to minimise
+    host↔device data movement, consistent with the SGCN GPU-resident pipeline.
+
+    Parameters
+    ----------
+    model           : GNN_PyG with a ``forward_layerwise`` method.
+    data            : PyG Data object (used only for ``train_labels_onehot``
+                      when *use_labels* is True).
+    criterion       : loss function.
+    optimizer       : optimizer.
+    device          : torch.device.
+    train_idx       : LongTensor – global training node indices.
+    n_layers        : int – number of GNN layers.
+    fanout          : int or list[int] – per-layer neighbour sample count.
+    train_batch_size: int – seed nodes per mini-batch (≈ 1/10 of train_idx).
+    use_labels      : bool – append one-hot label features to non-seed nodes.
+    n_classes       : int – label feature dimension (for use_labels).
+    x_dev, y_dev    : GPU-resident full-graph feature / label tensors.
+    edge_index_dev  : GPU-resident full-graph edge_index (unused directly,
+                      kept for interface parity with other train_epoch fns).
+    edge_attr_dev   : GPU-resident full-graph edge_attr or None
+                      (SAGEConv does not use edge attributes).
+    row_ptr_dev,
+    col_dev         : Pre-built CSR adjacency on *device*.
+
+    Returns
+    -------
+    avg_loss      : float  – mean BCE loss over all seed nodes in the epoch.
+    epoch_time    : float  – wall-clock epoch time (seconds).
+    sampling_time : float  – cumulative neighbourhood-expansion time (seconds).
+    """
+    model.train()
+
+    if x_dev is None:
+        x_dev = data.x.to(device)
+    if y_dev is None:
+        y_dev = data.y.to(device)
+
+    n_nodes = data.num_nodes
+
+    # Ensure fanout is a list aligned with n_layers.
+    if isinstance(fanout, int):
+        fanout_list = [fanout] * n_layers
+    else:
+        fanout_list = list(fanout)
+
+    # Shuffle training nodes and split into mini-batches.
+    # Corresponds to Algorithm 1, line 2: "for each mini-batch B ⊆ V".
+    train_idx_dev  = train_idx.to(device)
+    perm           = torch.randperm(len(train_idx_dev), device=device)
+    train_shuffled = train_idx_dev[perm]
+
+    n_train   = len(train_shuffled)
+    n_batches = max(1, (n_train + train_batch_size - 1) // train_batch_size)
+
+    loss_sum      = 0.0
+    total_seeds   = 0
+    sampling_time = 0.0
+
+    _cuda_sync(device)
+    epoch_start = time.time()
+
+    for b in range(n_batches):
+        # ── 1. Select seed nodes (B_L) ──────────────────────────────────────
+        start_idx  = b * train_batch_size
+        end_idx    = min(start_idx + train_batch_size, n_train)
+        seed_nodes = train_shuffled[start_idx:end_idx]   # B_L (global IDs)
+        n_seeds    = len(seed_nodes)
+
+        # ── 2. Expand neighbourhoods (Algorithm 2, lines 1-5) ───────────────
+        _cuda_sync(device)
+        t_sample = time.time()
+
+        node_sets, bipartite_edges = _build_sage_minibatch(
+            seed_nodes, row_ptr_dev, col_dev, n_nodes, fanout_list, device
+        )
+
+        _cuda_sync(device)
+        sampling_time += time.time() - t_sample
+
+        # node_sets[0] = B_0 (all nodes), node_sets[-1] = B_L (seeds).
+        # Seeds are the FIRST n_seeds entries in B_0 (by construction).
+        b0_global = node_sets[0]    # global IDs of all mini-batch nodes
+        n_B0      = len(b0_global)
+
+        # ── 3. Gather features ───────────────────────────────────────────────
+        x_batch = x_dev[b0_global]   # (n_B0, in_feats)
+        y_batch = y_dev[seed_nodes]  # (n_seeds, n_classes)
+
+        if use_labels:
+            # Reveal labels only for non-seed nodes (positions n_seeds..n_B0).
+            # Seeds keep zero label features to prevent target leakage.
+            # Use global IDs for correct lookup in train_labels_onehot.
+            # (train_labels_onehot[v] is non-zero only for training nodes v.)
+            non_seed_global = b0_global[n_seeds:]           # global IDs
+            labels_ext      = torch.zeros(n_B0, n_classes, device=device)
+            labels_ext[n_seeds:] = (
+                data.train_labels_onehot[non_seed_global.cpu()].to(device)
+            )
+            x_batch = torch.cat([x_batch, labels_ext], dim=-1)
+
+        # ── 4. Layer-wise SAGEConv aggregation (Algorithm 2, lines 6-10) ────
+        sizes = [len(ns) for ns in node_sets]  # [|B_0|, |B_1|, …, |B_L|]
+        pred  = model.forward_layerwise(x_batch, bipartite_edges, sizes)
+        # pred shape: (n_seeds, n_classes) – only seed-node predictions.
+
+        # ── 5. Loss + update ─────────────────────────────────────────────────
+        loss = criterion(pred, y_batch.float())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        loss_sum    += loss.item() * n_seeds
+        total_seeds += n_seeds
+
+        del x_batch, y_batch, pred, loss, node_sets, bipartite_edges, b0_global
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+    _cuda_sync(device)
+    epoch_time = time.time() - epoch_start
+
+    avg_loss = loss_sum / total_seeds if total_seeds > 0 else 0.0
+    return avg_loss, epoch_time, sampling_time
 
 
 def train_epoch_sgcn(model, data, criterion, optimizer, device,
@@ -944,6 +1283,10 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     elif mpnn == 'gcn':
         # GCN uses full-batch training; no DataLoader is required.
         train_loader = None
+    elif mpnn == 'sage':
+        # GraphSAGE uses manual neighbourhood sampling + layer-wise aggregation
+        # (train_epoch_sage).  No NeighborLoader or DataLoader is required.
+        train_loader = None
     else:
         train_loader = NeighborLoader(
             data,
@@ -954,7 +1297,8 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             num_workers=4,
         )
 
-    if mpnn != 'gcn':
+    # SAGE and GCN use full-batch evaluation; other modes use NeighborLoader.
+    if mpnn not in ('gcn', 'sage'):
         eval_loader = NeighborLoader(
             data,
             num_neighbors=[32] * n_layers,
@@ -1004,6 +1348,27 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         _gcn_x_dev = _gcn_edge_index_dev = _gcn_edge_attr_dev = None
         _gcn_train_idx_dev = _gcn_val_idx_dev = _gcn_test_idx_dev = None
 
+    # ── SAGE: pre-load full graph to GPU and build GPU-resident CSR. ─────────
+    # Pre-building the CSR once avoids repeated edge-sorting inside the
+    # per-mini-batch neighbourhood expansion, aligning with the SGCN
+    # GPU-resident pipeline strategy.  Labels for use_labels are looked up
+    # via global node IDs against data.train_labels_onehot (CPU-resident).
+    if mpnn == 'sage':
+        _sage_x_dev          = data.x.to(device)
+        _sage_y_dev          = data.y.to(device)
+        _sage_edge_index_dev = data.edge_index.to(device)
+        _sage_edge_attr_dev  = data.edge_attr.to(device) if data.edge_attr is not None else None
+        _sage_train_idx_dev  = train_idx.to(device)
+        _sage_val_idx_dev    = val_idx.to(device)
+        _sage_test_idx_dev   = test_idx.to(device)
+        _sage_row_ptr_dev, _sage_col_dev = _build_csr(
+            _sage_edge_index_dev, data.num_nodes, device
+        )
+    else:
+        (_sage_x_dev, _sage_y_dev, _sage_edge_index_dev, _sage_edge_attr_dev,
+         _sage_train_idx_dev, _sage_val_idx_dev, _sage_test_idx_dev,
+         _sage_row_ptr_dev, _sage_col_dev) = (None,) * 9
+
     _cuda_sync(device)
     run_start = time.time()
 
@@ -1039,6 +1404,22 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 _gcn_train_idx_dev, criterion, optimizer, device,
                 use_labels=use_labels, n_classes=n_classes,
                 train_labels_onehot=data.train_labels_onehot,
+            )
+        elif mpnn == 'sage':
+            # GraphSAGE: manual neighbour sampling + layer-wise aggregation.
+            # fanout [16] * n_layers mirrors the NeighborLoader num_neighbors
+            # that was previously used, preserving the same receptive-field
+            # budget (Hamilton et al. 2017 default S=25 per layer; 16 is the
+            # value used throughout this codebase).
+            loss, epoch_time, sampling_time = train_epoch_sage(
+                model, data, criterion, optimizer, device,
+                _sage_train_idx_dev, n_layers, [16] * n_layers, train_batch_size,
+                use_labels=use_labels, n_classes=n_classes,
+                x_dev=_sage_x_dev, y_dev=_sage_y_dev,
+                edge_index_dev=_sage_edge_index_dev,
+                edge_attr_dev=_sage_edge_attr_dev,
+                row_ptr_dev=_sage_row_ptr_dev,
+                col_dev=_sage_col_dev,
             )
         else:
             loss, epoch_time, sampling_time = train_epoch(
@@ -1076,6 +1457,18 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                  pred, eval_time) = evaluate_fullbatch(
                     model, _gcn_x_dev, _gcn_edge_index_dev, labels, _gcn_edge_attr_dev,
                     _gcn_train_idx_dev, _gcn_val_idx_dev, _gcn_test_idx_dev,
+                    criterion, evaluator_wrapper, device,
+                    use_labels=use_labels, n_classes=n_classes,
+                    train_labels_onehot=data.train_labels_onehot,
+                )
+            elif mpnn == 'sage':
+                # SAGE evaluation: full-batch inference over the entire graph
+                # (SAGEConv works identically in transductive full-batch mode).
+                (train_score, val_score, test_score,
+                 train_loss, val_loss, test_loss,
+                 pred, eval_time) = evaluate_fullbatch(
+                    model, _sage_x_dev, _sage_edge_index_dev, labels, _sage_edge_attr_dev,
+                    _sage_train_idx_dev, _sage_val_idx_dev, _sage_test_idx_dev,
                     criterion, evaluator_wrapper, device,
                     use_labels=use_labels, n_classes=n_classes,
                     train_labels_onehot=data.train_labels_onehot,
