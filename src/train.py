@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch_geometric.loader import NeighborLoader, GraphSAINTRandomWalkSampler
-from torch_geometric.utils import subgraph as pyg_subgraph
+from torch_geometric.loader import GraphSAINTRandomWalkSampler
+from torch_geometric.utils import sample, subgraph as pyg_subgraph
 
 from .utils import add_labels, gen_model
 
@@ -676,6 +676,20 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
 def train_epoch(model, dataloader, criterion, optimizer, device,
                 use_labels=False, n_classes=112):
+    if isinstance(dataloader, dict) and dataloader.get('mode') == 'manual_sage':
+        return train_epoch_manual_sage(
+            model=model,
+            data=dataloader['data'],
+            train_idx=dataloader['train_idx'],
+            fanouts=dataloader['fanouts'],
+            batch_size=dataloader['batch_size'],
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+            use_labels=use_labels,
+            n_classes=n_classes,
+        )
+
     model.train()
     loss_sum, total = 0, 0
     sampling_time   = 0.0
@@ -714,6 +728,162 @@ def train_epoch(model, dataloader, criterion, optimizer, device,
     epoch_time = time.time() - epoch_start
 
     return loss_sum / total, epoch_time, sampling_time
+
+
+def train_epoch_manual_sage(model, data, train_idx, fanouts, batch_size,
+                            criterion, optimizer, device,
+                            use_labels=False, n_classes=112):
+    """GraphSAGE training with manual per-layer neighbor sampling."""
+    model.train()
+    loss_sum, total = 0, 0
+    sampling_time = 0.0
+
+    _cuda_sync(device)
+    epoch_start = time.time()
+
+    x = data.x.to(device)
+    y = data.y.to(device)
+    edge_index = data.edge_index.to(device)
+    edge_attr = data.edge_attr.to(device) if data.edge_attr is not None else None
+    train_idx_dev = train_idx.to(device)
+
+    perm = torch.randperm(train_idx_dev.numel(), device=device)
+    shuffled = train_idx_dev[perm]
+
+    for start in range(0, shuffled.numel(), batch_size):
+        seeds = shuffled[start:start + batch_size]
+        if seeds.numel() == 0:
+            continue
+
+        t_sample = time.time()
+        n_id, sub_edge_index = _build_manual_sage_batch(
+            edge_index=edge_index,
+            seed_nodes=seeds,
+            fanouts=fanouts,
+            num_nodes=data.num_nodes,
+            device=device,
+        )
+        sampling_time += time.time() - t_sample
+
+        x_batch = x[n_id]
+        y_batch = y[n_id]
+        if use_labels:
+            non_seed_idx = torch.arange(seeds.numel(), n_id.numel(), device=device)
+            x_batch = add_labels(
+                x_batch,
+                data.train_labels_onehot[n_id.cpu()],
+                non_seed_idx,
+                n_classes,
+                device,
+            )
+
+        edge_attr_batch = None
+        if edge_attr is not None and sub_edge_index.numel() > 0:
+            # For SAGE in this repo edge_attr is unused, keep API-compatible.
+            edge_attr_batch = None
+
+        pred = model(x_batch, sub_edge_index, edge_attr_batch)
+        loss = criterion(pred[:seeds.numel()], y_batch[:seeds.numel()].float())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        loss_sum += loss.item() * seeds.numel()
+        total += seeds.numel()
+
+    _cuda_sync(device)
+    epoch_time = time.time() - epoch_start
+    return (loss_sum / total if total > 0 else 0.0), epoch_time, sampling_time
+
+
+def _pyg_sample_indices(candidates, num_samples):
+    """Sample up to ``num_samples`` entries from 1-D ``candidates``."""
+    if candidates.numel() <= num_samples:
+        return candidates
+    try:
+        return sample(candidates, num_samples, replace=False)
+    except TypeError:
+        # Backward-compatible fallback for older PyG ``sample`` signatures.
+        return sample(candidates, num_samples)
+
+
+def _build_manual_sage_batch(edge_index, seed_nodes, fanouts, num_nodes, device):
+    """Build a GraphSAGE-style sampled mini-batch without NeighborLoader.
+
+    Returns:
+        n_id: Global node IDs in local-batch order (seeds first).
+        sub_edge_index: Local edge index for sampled message passing edges.
+    """
+    row, col = edge_index
+    layers = []
+    frontier = seed_nodes
+    sampled_nodes = [seed_nodes]
+
+    for fanout in fanouts:
+        if frontier.numel() == 0:
+            layers.append((torch.empty(0, device=device, dtype=torch.long),
+                           torch.empty(0, device=device, dtype=torch.long)))
+            continue
+
+        frontier_mask = torch.isin(col, frontier)
+        cand_row = row[frontier_mask]
+        cand_col = col[frontier_mask]
+
+        if cand_row.numel() == 0:
+            layers.append((torch.empty(0, device=device, dtype=torch.long),
+                           torch.empty(0, device=device, dtype=torch.long)))
+            frontier = torch.empty(0, device=device, dtype=torch.long)
+            continue
+
+        picked_rows = []
+        picked_cols = []
+        for dst in frontier:
+            dst_mask = cand_col == dst
+            dst_neighbors = cand_row[dst_mask]
+            if dst_neighbors.numel() == 0:
+                continue
+            picked = _pyg_sample_indices(dst_neighbors, fanout)
+            picked_rows.append(picked)
+            picked_cols.append(torch.full_like(picked, dst))
+
+        if len(picked_rows) == 0:
+            layer_row = torch.empty(0, device=device, dtype=torch.long)
+            layer_col = torch.empty(0, device=device, dtype=torch.long)
+            frontier = torch.empty(0, device=device, dtype=torch.long)
+        else:
+            layer_row = torch.cat(picked_rows, dim=0)
+            layer_col = torch.cat(picked_cols, dim=0)
+            frontier = layer_row.unique()
+            sampled_nodes.append(frontier)
+
+        layers.append((layer_row, layer_col))
+
+    n_id = torch.cat(sampled_nodes, dim=0).unique()
+    # Keep seeds first to preserve batch_size slicing logic.
+    is_seed = torch.isin(n_id, seed_nodes)
+    n_id = torch.cat([n_id[is_seed], n_id[~is_seed]], dim=0)
+
+    local_pos = torch.full((num_nodes,), -1, device=device, dtype=torch.long)
+    local_pos[n_id] = torch.arange(n_id.numel(), device=device)
+
+    local_rows = []
+    local_cols = []
+    for layer_row, layer_col in layers:
+        if layer_row.numel() == 0:
+            continue
+        local_rows.append(local_pos[layer_row])
+        local_cols.append(local_pos[layer_col])
+
+    if len(local_rows) == 0:
+        sub_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+    else:
+        sub_edge_index = torch.stack(
+            [torch.cat(local_rows, dim=0), torch.cat(local_cols, dim=0)],
+            dim=0,
+        )
+
+    return n_id, sub_edge_index
 
 
 def train_epoch_fullbatch(model, x, edge_index, y, edge_attr, train_idx,
@@ -897,6 +1067,67 @@ def evaluate(model, dataloader, labels, train_idx, val_idx, test_idx,
     )
 
 
+@torch.no_grad()
+def evaluate_manual_sage(model, data, labels, train_idx, val_idx, test_idx,
+                         criterion, evaluator, device,
+                         use_labels=False, n_classes=112,
+                         fanouts=None, batch_size=32768):
+    """Evaluation for manual GraphSAGE sampling (NeighborLoader-free)."""
+    if fanouts is None:
+        fanouts = [32] * len(model.convs)
+
+    model.eval()
+    labels_dev = labels.to(device)
+    x = data.x.to(device)
+    edge_index = data.edge_index.to(device)
+
+    preds = torch.zeros(labels_dev.shape, device=device)
+    all_nodes = torch.cat([train_idx, val_idx, test_idx], dim=0).to(device)
+
+    _cuda_sync(device)
+    eval_start = time.time()
+
+    for start in range(0, all_nodes.numel(), batch_size):
+        seeds = all_nodes[start:start + batch_size]
+        if seeds.numel() == 0:
+            continue
+        n_id, sub_edge_index = _build_manual_sage_batch(
+            edge_index=edge_index,
+            seed_nodes=seeds,
+            fanouts=fanouts,
+            num_nodes=data.num_nodes,
+            device=device,
+        )
+        x_batch = x[n_id]
+        if use_labels:
+            all_local_idx = torch.arange(n_id.numel(), device=device)
+            x_batch = add_labels(
+                x_batch,
+                data.train_labels_onehot[n_id.cpu()],
+                all_local_idx,
+                n_classes,
+                device,
+            )
+        pred = model(x_batch, sub_edge_index, None)
+        preds[seeds] = pred[:seeds.numel()]
+
+    _cuda_sync(device)
+    eval_time = time.time() - eval_start
+
+    train_loss = criterion(preds[train_idx], labels_dev[train_idx].float()).item()
+    val_loss = criterion(preds[val_idx], labels_dev[val_idx].float()).item()
+    test_loss = criterion(preds[test_idx], labels_dev[test_idx].float()).item()
+
+    return (
+        evaluator(preds[train_idx], labels_dev[train_idx]),
+        evaluator(preds[val_idx], labels_dev[val_idx]),
+        evaluator(preds[test_idx], labels_dev[test_idx]),
+        train_loss, val_loss, test_loss,
+        preds,
+        eval_time,
+    )
+
+
 def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         gen_model_fn, device, n_layers, lr, weight_decay, n_epochs,
         eval_every, log_every, save_pred, use_labels=False, n_classes=112,
@@ -945,26 +1176,16 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         # GCN uses full-batch training; no DataLoader is required.
         train_loader = None
     else:
-        train_loader = NeighborLoader(
-            data,
-            num_neighbors=[16] * n_layers,
-            batch_size=train_batch_size,
-            input_nodes=train_idx.cpu(),
-            shuffle=True,
-            num_workers=4,
-        )
+        # Manual GraphSAGE mini-batch sampling config (NeighborLoader-free).
+        train_loader = {
+            'mode': 'manual_sage',
+            'data': data,
+            'train_idx': train_idx,
+            'fanouts': [16] * n_layers,
+            'batch_size': train_batch_size,
+        }
 
-    if mpnn != 'gcn':
-        eval_loader = NeighborLoader(
-            data,
-            num_neighbors=[32] * n_layers,
-            batch_size=32768,
-            input_nodes=torch.cat([train_idx.cpu(), val_idx.cpu(), test_idx.cpu()]),
-            shuffle=False,
-            num_workers=4,
-        )
-    else:
-        eval_loader = None
+    eval_loader = None
 
     criterion    = nn.BCEWithLogitsLoss()
     model        = gen_model_fn().to(device)
@@ -1083,9 +1304,11 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             else:
                 (train_score, val_score, test_score,
                  train_loss, val_loss, test_loss,
-                 pred, eval_time) = evaluate(
-                    model, eval_loader, labels, train_idx, val_idx, test_idx,
-                    criterion, evaluator_wrapper, device, use_labels, n_classes
+                 pred, eval_time) = evaluate_manual_sage(
+                    model, data, labels, train_idx, val_idx, test_idx,
+                    criterion, evaluator_wrapper, device,
+                    use_labels=use_labels, n_classes=n_classes,
+                    fanouts=[32] * n_layers, batch_size=32768
                 )
 
             record['val_auc']   = val_score
