@@ -302,12 +302,14 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         x_full_dev = data.x.to(device)
     if y_full_dev is None:
         y_full_dev = data.y.to(device)
-    if edge_attr_dev is None and data.edge_attr is not None:
-        edge_attr_dev = data.edge_attr.to(device)
     if edge_index_eval_dev is None:
         edge_index_eval_dev = edge_index_dev
     if edge_attr_eval_dev is None:
         edge_attr_eval_dev = edge_attr_dev
+    if edge_attr_dev is not None and edge_attr_dev.size(0) != edge_index_dev.size(1):
+        edge_attr_dev = None
+    if edge_attr_eval_dev is not None and edge_attr_eval_dev.size(0) != edge_index_eval_dev.size(1):
+        edge_attr_eval_dev = None
 
     # Move split indices to device so all isin/randperm ops stay on GPU.
     train_idx_dev = train_idx.to(device)
@@ -994,11 +996,11 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         _sgcn_x_dev          = data_train.x.to(device)
         _sgcn_y_dev          = data_train.y.to(device)
         _sgcn_edge_index_dev = data_train.edge_index.to(device)
-        train_edge_attr = getattr(data_train, 'edge_attr', None)
-        _sgcn_edge_attr_dev  = train_edge_attr.to(device) if train_edge_attr is not None else None
+        # SGCN uses GCNConv without edge features, and OOD rewiring can leave
+        # stale edge_attr rows that no longer match edge_index. Drop them.
+        _sgcn_edge_attr_dev  = None
         _sgcn_edge_index_eval_dev = data_eval.edge_index.to(device)
-        eval_edge_attr = getattr(data_eval, 'edge_attr', None)
-        _sgcn_edge_attr_eval_dev  = eval_edge_attr.to(device) if eval_edge_attr is not None else None
+        _sgcn_edge_attr_eval_dev  = None
         _sgcn_train_idx_dev  = train_idx.to(device)
         _sgcn_val_idx_dev    = val_idx.to(device)
     else:
