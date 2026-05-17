@@ -127,10 +127,10 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
     rewired_per_node = {}
     available_for_removal = torch.ones(num_undirected_edges, dtype=torch.bool, device=device)
 
-    for node in selected_nodes.tolist():
-        node_tensor = torch.tensor(node, device=device, dtype=torch.long)
-        start = torch.searchsorted(inc_nodes_sorted, node_tensor, right=False)
-        end = torch.searchsorted(inc_nodes_sorted, node_tensor, right=True)
+    selected_nodes_list = selected_nodes.tolist()
+    selected_starts = torch.searchsorted(inc_nodes_sorted, selected_nodes, right=False).tolist()
+    selected_ends = torch.searchsorted(inc_nodes_sorted, selected_nodes, right=True).tolist()
+    for node, start, end in zip(selected_nodes_list, selected_starts, selected_ends):
         incident_ids = inc_edge_ids_sorted[start:end]
         incident_ids = incident_ids[available_for_removal[incident_ids]]
         degree = int(incident_ids.numel())
