@@ -147,24 +147,25 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
         candidate_mask[neighbors] = False
         candidates = candidate_mask.nonzero(as_tuple=False).squeeze(1)
 
-        add_k = min(k, int(candidates.numel()))
-        if add_k <= 0:
+        # Effective rewiring count after enforcing unique/non-self candidates.
+        effective_k = min(k, int(candidates.numel()))
+        if effective_k <= 0:
             rewired_per_node[node] = 0
             continue
 
-        rm_perm = torch.randperm(degree, generator=generator, device=device)[:add_k]
+        rm_perm = torch.randperm(degree, generator=generator, device=device)[:effective_k]
         rm_ids = incident_ids[rm_perm]
-        cand_perm = torch.randperm(candidates.numel(), generator=generator, device=device)[:add_k]
+        cand_perm = torch.randperm(candidates.numel(), generator=generator, device=device)[:effective_k]
         new_neighbors = candidates[cand_perm]
 
-        node_vec = torch.full((add_k,), node, dtype=torch.long, device=device)
+        node_vec = torch.full((effective_k,), node, dtype=torch.long, device=device)
         add_u = torch.minimum(node_vec, new_neighbors)
         add_v = torch.maximum(node_vec, new_neighbors)
 
         remove_edge_ids.append(rm_ids)
         add_u_list.append(add_u)
         add_v_list.append(add_v)
-        rewired_per_node[node] = add_k
+        rewired_per_node[node] = effective_k
 
     keep_mask = torch.ones(num_undirected_edges, dtype=torch.bool, device=device)
     total_rewired = 0

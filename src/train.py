@@ -994,9 +994,11 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         _sgcn_x_dev          = data_train.x.to(device)
         _sgcn_y_dev          = data_train.y.to(device)
         _sgcn_edge_index_dev = data_train.edge_index.to(device)
-        _sgcn_edge_attr_dev  = data_train.edge_attr.to(device) if getattr(data_train, 'edge_attr', None) is not None else None
+        train_edge_attr = getattr(data_train, 'edge_attr', None)
+        _sgcn_edge_attr_dev  = train_edge_attr.to(device) if train_edge_attr is not None else None
         _sgcn_edge_index_eval_dev = data_eval.edge_index.to(device)
-        _sgcn_edge_attr_eval_dev  = data_eval.edge_attr.to(device) if getattr(data_eval, 'edge_attr', None) is not None else None
+        eval_edge_attr = getattr(data_eval, 'edge_attr', None)
+        _sgcn_edge_attr_eval_dev  = eval_edge_attr.to(device) if eval_edge_attr is not None else None
         _sgcn_train_idx_dev  = train_idx.to(device)
         _sgcn_val_idx_dev    = val_idx.to(device)
     else:
@@ -1008,10 +1010,12 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     if mpnn == 'gcn':
         _gcn_x_train_dev          = data_train.x.to(device)
         _gcn_edge_index_train_dev = data_train.edge_index.to(device)
-        _gcn_edge_attr_train_dev  = data_train.edge_attr.to(device) if getattr(data_train, 'edge_attr', None) is not None else None
+        train_edge_attr = getattr(data_train, 'edge_attr', None)
+        _gcn_edge_attr_train_dev  = train_edge_attr.to(device) if train_edge_attr is not None else None
         _gcn_x_eval_dev           = data_eval.x.to(device)
         _gcn_edge_index_eval_dev  = data_eval.edge_index.to(device)
-        _gcn_edge_attr_eval_dev   = data_eval.edge_attr.to(device) if getattr(data_eval, 'edge_attr', None) is not None else None
+        eval_edge_attr = getattr(data_eval, 'edge_attr', None)
+        _gcn_edge_attr_eval_dev   = eval_edge_attr.to(device) if eval_edge_attr is not None else None
         _gcn_train_idx_dev  = train_idx.to(device)
         _gcn_val_idx_dev    = val_idx.to(device)
         _gcn_test_idx_dev   = test_idx.to(device)
