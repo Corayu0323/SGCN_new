@@ -181,6 +181,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                      debug_subgraph_stats=False,
                      x_full_dev=None, y_full_dev=None,
                      edge_index_dev=None, edge_attr_dev=None,
+                     edge_index_eval_dev=None, edge_attr_eval_dev=None,
                      min_subgraph_nodes=0,
                      min_train_nodes_in_subgraph=_SGCN_MIN_TRAIN_NODES):
     """SGCN training epoch with subgraph sampling, local multi-epoch training,
@@ -303,6 +304,10 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         y_full_dev = data.y.to(device)
     if edge_attr_dev is None and data.edge_attr is not None:
         edge_attr_dev = data.edge_attr.to(device)
+    if edge_index_eval_dev is None:
+        edge_index_eval_dev = edge_index_dev
+    if edge_attr_eval_dev is None:
+        edge_attr_eval_dev = edge_attr_dev
 
     # Move split indices to device so all isin/randperm ops stay on GPU.
     train_idx_dev = train_idx.to(device)
@@ -515,10 +520,10 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
             # Build eval subgraph on GPU – same approach as training subgraph.
             in_eval_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
             in_eval_mask[eval_node_idx] = True
-            edge_keep_eval = in_eval_mask[edge_index_dev[0]] & in_eval_mask[edge_index_dev[1]]
+            edge_keep_eval = in_eval_mask[edge_index_eval_dev[0]] & in_eval_mask[edge_index_eval_dev[1]]
             del in_eval_mask
-            ei_eval_global = edge_index_dev[:, edge_keep_eval]
-            ea_eval = edge_attr_dev[edge_keep_eval] if edge_attr_dev is not None else None
+            ei_eval_global = edge_index_eval_dev[:, edge_keep_eval]
+            ea_eval = edge_attr_eval_dev[edge_keep_eval] if edge_attr_eval_dev is not None else None
 
             # Apply the same edge cap to the eval subgraph.
             if max_subgraph_edges is not None and max_subgraph_edges > 0:
@@ -700,7 +705,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device,
         else:
             x = batch.x
 
-        pred = model(x, batch.edge_index, batch.edge_attr)
+        pred = model(x, batch.edge_index, getattr(batch, 'edge_attr', None))
         loss = criterion(pred[:batch_size], batch.y[:batch_size].float())
 
         optimizer.zero_grad()
@@ -823,7 +828,7 @@ def train_epoch_saint(model, dataloader, criterion, optimizer, device,
         else:
             x = batch.x
 
-        pred = model(x, batch.edge_index, batch.edge_attr)
+        pred = model(x, batch.edge_index, getattr(batch, 'edge_attr', None))
 
         # Apply GraphSAINT sampling normalisation weights when available.
         if hasattr(batch, 'node_norm'):
@@ -875,7 +880,7 @@ def evaluate(model, dataloader, labels, train_idx, val_idx, test_idx,
             else:
                 x = batch.x
 
-            pred = model(x, batch.edge_index, batch.edge_attr)
+            pred = model(x, batch.edge_index, getattr(batch, 'edge_attr', None))
             preds[batch.n_id[:batch_size]] += pred[:batch_size]
 
     preds /= eval_times
@@ -910,28 +915,32 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         max_subgraph_edges=300000,
         debug_subgraph_stats=False,
         min_subgraph_nodes=0,
-        min_train_nodes_in_subgraph=_SGCN_MIN_TRAIN_NODES):
+        min_train_nodes_in_subgraph=_SGCN_MIN_TRAIN_NODES,
+        data_train=None,
+        data_eval=None):
     evaluator_wrapper = lambda pred, lbls: evaluator.eval(
         {'y_pred': pred, 'y_true': lbls}
     )['rocauc']
 
     train_batch_size = (len(train_idx) + 9) // 10
+    data_train = data if data_train is None else data_train
+    data_eval = data if data_eval is None else data_eval
 
     if mpnn == 'graphsaint':
         # Attach boolean split masks to data so GraphSAINT batches inherit them.
-        data.train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-        data.train_mask[train_idx] = True
-        data.val_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-        data.val_mask[val_idx] = True
-        data.test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-        data.test_mask[test_idx] = True
+        data_train.train_mask = torch.zeros(data_train.num_nodes, dtype=torch.bool)
+        data_train.train_mask[train_idx] = True
+        data_train.val_mask = torch.zeros(data_train.num_nodes, dtype=torch.bool)
+        data_train.val_mask[val_idx] = True
+        data_train.test_mask = torch.zeros(data_train.num_nodes, dtype=torch.bool)
+        data_train.test_mask[test_idx] = True
 
         # GraphSAINT: sample random-walk-induced subgraphs instead of
         # per-node neighborhoods.  num_steps mirrors the ~10 batches/epoch
         # produced by NeighborLoader, and walk_length provides a 2-hop reach.
         saint_num_steps = max(len(train_idx) // train_batch_size, 1)
         train_loader = GraphSAINTRandomWalkSampler(
-            data,
+            data_train,
             batch_size=train_batch_size,
             walk_length=2,
             num_steps=saint_num_steps,
@@ -946,7 +955,7 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         train_loader = None
     else:
         train_loader = NeighborLoader(
-            data,
+            data_train,
             num_neighbors=[16] * n_layers,
             batch_size=train_batch_size,
             input_nodes=train_idx.cpu(),
@@ -956,7 +965,7 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
 
     if mpnn != 'gcn':
         eval_loader = NeighborLoader(
-            data,
+            data_eval,
             num_neighbors=[32] * n_layers,
             batch_size=32768,
             input_nodes=torch.cat([train_idx.cpu(), val_idx.cpu(), test_idx.cpu()]),
@@ -982,26 +991,37 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     # Doing this once here avoids repeated host→device copies inside the inner
     # subgraph loop, which was the primary cause of CPU-bound behaviour.
     if mpnn == 'sgcn':
-        _sgcn_x_dev         = data.x.to(device)
-        _sgcn_y_dev         = data.y.to(device)
-        _sgcn_edge_index_dev = data.edge_index.to(device)
-        _sgcn_edge_attr_dev  = data.edge_attr.to(device) if data.edge_attr is not None else None
+        _sgcn_x_dev          = data_train.x.to(device)
+        _sgcn_y_dev          = data_train.y.to(device)
+        _sgcn_edge_index_dev = data_train.edge_index.to(device)
+        train_edge_attr = getattr(data_train, 'edge_attr', None)
+        _sgcn_edge_attr_dev  = train_edge_attr.to(device) if train_edge_attr is not None else None
+        _sgcn_edge_index_eval_dev = data_eval.edge_index.to(device)
+        eval_edge_attr = getattr(data_eval, 'edge_attr', None)
+        _sgcn_edge_attr_eval_dev  = eval_edge_attr.to(device) if eval_edge_attr is not None else None
         _sgcn_train_idx_dev  = train_idx.to(device)
         _sgcn_val_idx_dev    = val_idx.to(device)
     else:
         _sgcn_x_dev = _sgcn_y_dev = _sgcn_edge_index_dev = _sgcn_edge_attr_dev = None
+        _sgcn_edge_index_eval_dev = _sgcn_edge_attr_eval_dev = None
         _sgcn_train_idx_dev = _sgcn_val_idx_dev = None
 
     # ── GCN: pre-load full graph to GPU for full-batch training/evaluation. ──
     if mpnn == 'gcn':
-        _gcn_x_dev          = data.x.to(device)
-        _gcn_edge_index_dev = data.edge_index.to(device)
-        _gcn_edge_attr_dev  = data.edge_attr.to(device) if data.edge_attr is not None else None
+        _gcn_x_train_dev          = data_train.x.to(device)
+        _gcn_edge_index_train_dev = data_train.edge_index.to(device)
+        train_edge_attr = getattr(data_train, 'edge_attr', None)
+        _gcn_edge_attr_train_dev  = train_edge_attr.to(device) if train_edge_attr is not None else None
+        _gcn_x_eval_dev           = data_eval.x.to(device)
+        _gcn_edge_index_eval_dev  = data_eval.edge_index.to(device)
+        eval_edge_attr = getattr(data_eval, 'edge_attr', None)
+        _gcn_edge_attr_eval_dev   = eval_edge_attr.to(device) if eval_edge_attr is not None else None
         _gcn_train_idx_dev  = train_idx.to(device)
         _gcn_val_idx_dev    = val_idx.to(device)
         _gcn_test_idx_dev   = test_idx.to(device)
     else:
-        _gcn_x_dev = _gcn_edge_index_dev = _gcn_edge_attr_dev = None
+        _gcn_x_train_dev = _gcn_edge_index_train_dev = _gcn_edge_attr_train_dev = None
+        _gcn_x_eval_dev = _gcn_edge_index_eval_dev = _gcn_edge_attr_eval_dev = None
         _gcn_train_idx_dev = _gcn_val_idx_dev = _gcn_test_idx_dev = None
 
     _cuda_sync(device)
@@ -1030,15 +1050,17 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 y_full_dev=_sgcn_y_dev,
                 edge_index_dev=_sgcn_edge_index_dev,
                 edge_attr_dev=_sgcn_edge_attr_dev,
+                edge_index_eval_dev=_sgcn_edge_index_eval_dev,
+                edge_attr_eval_dev=_sgcn_edge_attr_eval_dev,
                 min_subgraph_nodes=min_subgraph_nodes,
                 min_train_nodes_in_subgraph=min_train_nodes_in_subgraph,
             )
         elif mpnn == 'gcn':
             loss, epoch_time, sampling_time = train_epoch_fullbatch(
-                model, _gcn_x_dev, _gcn_edge_index_dev, labels, _gcn_edge_attr_dev,
+                model, _gcn_x_train_dev, _gcn_edge_index_train_dev, labels, _gcn_edge_attr_train_dev,
                 _gcn_train_idx_dev, criterion, optimizer, device,
                 use_labels=use_labels, n_classes=n_classes,
-                train_labels_onehot=data.train_labels_onehot,
+                train_labels_onehot=data_train.train_labels_onehot,
             )
         else:
             loss, epoch_time, sampling_time = train_epoch(
@@ -1074,11 +1096,11 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 (train_score, val_score, test_score,
                  train_loss, val_loss, test_loss,
                  pred, eval_time) = evaluate_fullbatch(
-                    model, _gcn_x_dev, _gcn_edge_index_dev, labels, _gcn_edge_attr_dev,
+                    model, _gcn_x_eval_dev, _gcn_edge_index_eval_dev, labels, _gcn_edge_attr_eval_dev,
                     _gcn_train_idx_dev, _gcn_val_idx_dev, _gcn_test_idx_dev,
                     criterion, evaluator_wrapper, device,
                     use_labels=use_labels, n_classes=n_classes,
-                    train_labels_onehot=data.train_labels_onehot,
+                    train_labels_onehot=data_eval.train_labels_onehot,
                 )
             else:
                 (train_score, val_score, test_score,
