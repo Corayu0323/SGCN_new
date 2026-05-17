@@ -53,7 +53,7 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
     for node in selected_nodes_list:
         neighbors = list(adjacency[node])
         degree = len(neighbors)
-        k = int(np.floor(rewire_ratio * degree))
+        k = int(rewire_ratio * degree)
         if k <= 0 or degree == 0:
             rewired_per_node[node] = 0
             continue
