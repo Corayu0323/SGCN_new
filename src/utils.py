@@ -125,12 +125,14 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
     add_u_list = []
     add_v_list = []
     rewired_per_node = {}
+    available_for_removal = torch.ones(num_undirected_edges, dtype=torch.bool, device=device)
 
     for node in selected_nodes.tolist():
         node_tensor = torch.tensor(node, device=device, dtype=torch.long)
         start = torch.searchsorted(inc_nodes_sorted, node_tensor, right=False)
         end = torch.searchsorted(inc_nodes_sorted, node_tensor, right=True)
         incident_ids = inc_edge_ids_sorted[start:end]
+        incident_ids = incident_ids[available_for_removal[incident_ids]]
         degree = int(incident_ids.numel())
         if degree == 0:
             rewired_per_node[node] = 0
@@ -166,6 +168,7 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
         add_u_list.append(add_u)
         add_v_list.append(add_v)
         rewired_per_node[node] = effective_k
+        available_for_removal[rm_ids] = False
 
     keep_mask = torch.ones(num_undirected_edges, dtype=torch.bool, device=device)
     total_rewired = 0
