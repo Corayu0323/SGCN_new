@@ -4,13 +4,19 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from ogb.nodeproppred import Evaluator, PygNodePropPredDataset
-from torch_geometric.utils import scatter
+from torch_geometric.utils import coalesce, remove_self_loops, scatter, to_undirected
 
 from .models import GNN_PyG
 
 
 def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
-    """Apply OOD graph perturbation by Bernoulli node sampling + edge rewiring."""
+    """Apply OOD perturbation (fast tensorized implementation).
+
+    The perturbation rewires only edges incident to selected nodes, aiming for
+    per-node remove-k/add-k balance (degree approximately preserved). The
+    output graph is intended for training-time edge augmentation; node features
+    are kept unchanged and edge_attr is intentionally dropped.
+    """
     if not (0.0 <= node_ratio <= 1.0):
         raise ValueError(f'node_ratio must be in [0, 1], got {node_ratio}')
     if not (0.0 <= rewire_ratio <= 1.0):
@@ -19,136 +25,208 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
     edge_index = data.edge_index
     device = edge_index.device
     num_nodes = int(data.num_nodes)
-    rng = random.Random(int(seed))
+    if num_nodes == 0 or edge_index.numel() == 0:
+        data_ood = data.clone()
+        data_ood.edge_attr = None
+        stats = {
+            'selected_nodes': torch.empty(0, dtype=torch.long),
+            'num_selected_nodes': 0,
+            'selected_ratio': 0.0,
+            'num_edges_before': int(edge_index.size(1)),
+            'num_edges_after': int(edge_index.size(1)),
+            'rewired_edges': 0,
+            'max_rewired_per_node': 0,
+            'mean_degree_before': 0.0,
+            'mean_degree_after': 0.0,
+            'degree_change': {},
+            'degree_change_summary': {
+                'mean': 0.0,
+                'std': 0.0,
+                'max_abs': 0.0,
+            },
+        }
+        return data_ood, stats
 
-    selected_nodes_list = [i for i in range(num_nodes) if rng.random() < node_ratio]
-    selected_nodes = torch.tensor(selected_nodes_list, dtype=torch.long)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
 
-    edge_index_cpu = edge_index.cpu()
-    edge_attr_cpu = data.edge_attr.cpu() if getattr(data, 'edge_attr', None) is not None else None
-    edge_attr_dim = int(edge_attr_cpu.shape[1]) if edge_attr_cpu is not None else 0
+    undirected_no_loops, _ = remove_self_loops(edge_index)
+    undirected = to_undirected(undirected_no_loops, num_nodes=num_nodes)
+    undirected = coalesce(undirected, None, num_nodes, num_nodes)[0]
+    u, v = undirected[0], undirected[1]
+    if u.numel() == 0:
+        data_ood = data.clone()
+        data_ood.edge_attr = None
+        stats = {
+            'selected_nodes': torch.empty(0, dtype=torch.long),
+            'num_selected_nodes': 0,
+            'selected_ratio': 0.0,
+            'num_edges_before': int(edge_index.size(1)),
+            'num_edges_after': int(edge_index.size(1)),
+            'rewired_edges': 0,
+            'max_rewired_per_node': 0,
+            'mean_degree_before': 0.0,
+            'mean_degree_after': 0.0,
+            'degree_change': {},
+            'degree_change_summary': {
+                'mean': 0.0,
+                'std': 0.0,
+                'max_abs': 0.0,
+            },
+        }
+        return data_ood, stats
 
-    adjacency = [set() for _ in range(num_nodes)]
-    undirected_edges = set()
-    self_loops = set()
-    edge_attr_map = {}
+    # keep upper-triangular undirected representation (u < v) for rewiring.
+    mask_upper = u < v
+    u = u[mask_upper]
+    v = v[mask_upper]
+    num_undirected_edges = u.numel()
 
-    for e in range(edge_index_cpu.shape[1]):
-        u = int(edge_index_cpu[0, e])
-        v = int(edge_index_cpu[1, e])
-        if u == v:
-            self_loops.add(u)
-            continue
-        a, b = (u, v) if u < v else (v, u)
-        undirected_edges.add((a, b))
-        adjacency[a].add(b)
-        adjacency[b].add(a)
-        if edge_attr_cpu is not None and (a, b) not in edge_attr_map:
-            edge_attr_map[(a, b)] = edge_attr_cpu[e].clone()
+    node_candidates = torch.arange(num_nodes, device=device)
+    select_mask = torch.rand(node_candidates.numel(), generator=generator, device=device) < node_ratio
+    selected_nodes = node_candidates[select_mask]
+    selected_nodes_cpu = selected_nodes.cpu()
 
-    degree_before = {n: len(adjacency[n]) for n in selected_nodes_list}
+    if selected_nodes.numel() == 0:
+        edge_index_ood = torch.cat([torch.stack([u, v], dim=0), torch.stack([v, u], dim=0)], dim=1)
+        edge_index_ood = coalesce(edge_index_ood, None, num_nodes, num_nodes)[0]
+        data_ood = data.clone()
+        data_ood.edge_index = edge_index_ood
+        data_ood.edge_attr = None
+        stats = {
+            'selected_nodes': selected_nodes_cpu,
+            'num_selected_nodes': 0,
+            'selected_ratio': 0.0,
+            'num_edges_before': int(edge_index.size(1)),
+            'num_edges_after': int(edge_index_ood.size(1)),
+            'rewired_edges': 0,
+            'max_rewired_per_node': 0,
+            'mean_degree_before': 0.0,
+            'mean_degree_after': 0.0,
+            'degree_change': {},
+            'degree_change_summary': {
+                'mean': 0.0,
+                'std': 0.0,
+                'max_abs': 0.0,
+            },
+        }
+        return data_ood, stats
+
+    # Incidence index (CSR-like) for O(1) access to each node's incident edges.
+    edge_ids = torch.arange(num_undirected_edges, device=device)
+    inc_nodes = torch.cat([u, v], dim=0)
+    inc_edge_ids = torch.cat([edge_ids, edge_ids], dim=0)
+    inc_perm = inc_nodes.argsort()
+    inc_nodes_sorted = inc_nodes[inc_perm]
+    inc_edge_ids_sorted = inc_edge_ids[inc_perm]
+    deg_before_all = torch.bincount(inc_nodes, minlength=num_nodes)
+
+    remove_edge_ids = []
+    add_u_list = []
+    add_v_list = []
     rewired_per_node = {}
-    total_rewired = 0
 
-    for node in selected_nodes_list:
-        neighbors = list(adjacency[node])
-        degree = len(neighbors)
-        k = int(rewire_ratio * degree)
-        if k <= 0 or degree == 0:
+    for node in selected_nodes.tolist():
+        node_tensor = torch.tensor(node, device=device, dtype=torch.long)
+        start = torch.searchsorted(inc_nodes_sorted, node_tensor, right=False)
+        end = torch.searchsorted(inc_nodes_sorted, node_tensor, right=True)
+        incident_ids = inc_edge_ids_sorted[start:end]
+        degree = int(incident_ids.numel())
+        if degree == 0:
             rewired_per_node[node] = 0
             continue
 
-        k = min(k, degree)
-        removed_edges = []
-        for nbr in rng.sample(neighbors, k):
-            if nbr not in adjacency[node]:
-                continue
-            adjacency[node].remove(nbr)
-            adjacency[nbr].remove(node)
-            a, b = (node, nbr) if node < nbr else (nbr, node)
-            undirected_edges.discard((a, b))
-            attr = edge_attr_map.pop((a, b), None) if edge_attr_cpu is not None else None
-            removed_edges.append((nbr, attr))
+        k = min(int(rewire_ratio * degree), degree)
+        if k <= 0:
+            rewired_per_node[node] = 0
+            continue
 
-        added = 0
-        max_attempts = max(100, 20 * k)
-        attempts = 0
-        while added < len(removed_edges) and attempts < max_attempts:
-            attempts += 1
-            cand = rng.randrange(num_nodes)
-            if cand == node or cand in adjacency[node]:
-                continue
+        neighbors = torch.where(u[incident_ids] == node, v[incident_ids], u[incident_ids])
+        candidate_mask = torch.ones(num_nodes, dtype=torch.bool, device=device)
+        candidate_mask[node] = False
+        candidate_mask[neighbors] = False
+        candidates = candidate_mask.nonzero(as_tuple=False).squeeze(1)
 
-            adjacency[node].add(cand)
-            adjacency[cand].add(node)
-            a, b = (node, cand) if node < cand else (cand, node)
-            undirected_edges.add((a, b))
-            if edge_attr_cpu is not None:
-                src_attr = removed_edges[added][1]
-                if src_attr is None:
-                    src_attr = torch.zeros(edge_attr_dim, dtype=edge_attr_cpu.dtype)
-                edge_attr_map[(a, b)] = src_attr.clone()
-            added += 1
+        add_k = min(k, int(candidates.numel()))
+        if add_k <= 0:
+            rewired_per_node[node] = 0
+            continue
 
-        # If unable to add enough fresh edges, restore leftovers to keep degree stable.
-        if added < len(removed_edges):
-            for idx in range(added, len(removed_edges)):
-                nbr, attr = removed_edges[idx]
-                if nbr == node or nbr in adjacency[node]:
-                    continue
-                adjacency[node].add(nbr)
-                adjacency[nbr].add(node)
-                a, b = (node, nbr) if node < nbr else (nbr, node)
-                undirected_edges.add((a, b))
-                if edge_attr_cpu is not None:
-                    if attr is None:
-                        attr = torch.zeros(edge_attr_dim, dtype=edge_attr_cpu.dtype)
-                    edge_attr_map[(a, b)] = attr.clone()
+        rm_perm = torch.randperm(degree, generator=generator, device=device)[:add_k]
+        rm_ids = incident_ids[rm_perm]
+        cand_perm = torch.randperm(candidates.numel(), generator=generator, device=device)[:add_k]
+        new_neighbors = candidates[cand_perm]
 
-        rewired_per_node[node] = added
-        total_rewired += added
+        node_vec = torch.full((add_k,), node, dtype=torch.long, device=device)
+        add_u = torch.minimum(node_vec, new_neighbors)
+        add_v = torch.maximum(node_vec, new_neighbors)
 
-    degree_after = {n: len(adjacency[n]) for n in selected_nodes_list}
-    degree_change = {n: degree_after[n] - degree_before[n] for n in selected_nodes_list}
+        remove_edge_ids.append(rm_ids)
+        add_u_list.append(add_u)
+        add_v_list.append(add_v)
+        rewired_per_node[node] = add_k
 
-    directed_edges = []
-    directed_attrs = []
-    for u, v in sorted(undirected_edges):
-        directed_edges.append([u, v])
-        directed_edges.append([v, u])
-        if edge_attr_cpu is not None:
-            attr = edge_attr_map.get((u, v))
-            if attr is None:
-                attr = torch.zeros(edge_attr_dim, dtype=edge_attr_cpu.dtype)
-            directed_attrs.append(attr.clone())
-            directed_attrs.append(attr.clone())
+    keep_mask = torch.ones(num_undirected_edges, dtype=torch.bool, device=device)
+    total_rewired = 0
+    if remove_edge_ids:
+        remove_ids = torch.unique(torch.cat(remove_edge_ids, dim=0))
+        keep_mask[remove_ids] = False
+        total_rewired = int(remove_ids.numel())
 
-    for u in sorted(self_loops):
-        directed_edges.append([u, u])
-        if edge_attr_cpu is not None:
-            directed_attrs.append(torch.zeros(edge_attr_dim, dtype=edge_attr_cpu.dtype))
+    if add_u_list:
+        add_u = torch.cat(add_u_list, dim=0)
+        add_v = torch.cat(add_v_list, dim=0)
+        u_new = torch.cat([u[keep_mask], add_u], dim=0)
+        v_new = torch.cat([v[keep_mask], add_v], dim=0)
+    else:
+        u_new = u[keep_mask]
+        v_new = v[keep_mask]
 
-    edge_index_ood = torch.tensor(directed_edges, dtype=torch.long).t().contiguous()
+    undirected_new = torch.stack([u_new, v_new], dim=0)
+    undirected_new = coalesce(undirected_new, None, num_nodes, num_nodes)[0]
+    undirected_new = undirected_new[:, undirected_new[0] < undirected_new[1]]
+    edge_index_ood = torch.cat([undirected_new, undirected_new.flip(0)], dim=1)
+    edge_index_ood = coalesce(edge_index_ood, None, num_nodes, num_nodes)[0]
+
+    # Degree stats on selected nodes (undirected degree).
+    deg_after_all = torch.bincount(
+        torch.cat([undirected_new[0], undirected_new[1]], dim=0),
+        minlength=num_nodes,
+    )
+    selected_before = deg_before_all[selected_nodes]
+    selected_after = deg_after_all[selected_nodes]
+    selected_change = selected_after - selected_before
+
+    degree_change = {
+        int(n): int(dc)
+        for n, dc in zip(selected_nodes_cpu.tolist(), selected_change.cpu().tolist())
+    }
+    mean_before = float(selected_before.float().mean().item()) if selected_before.numel() > 0 else 0.0
+    mean_after = float(selected_after.float().mean().item()) if selected_after.numel() > 0 else 0.0
+    change_mean = float(selected_change.float().mean().item()) if selected_change.numel() > 0 else 0.0
+    change_std = float(selected_change.float().std(unbiased=False).item()) if selected_change.numel() > 0 else 0.0
+    change_max_abs = float(selected_change.abs().max().item()) if selected_change.numel() > 0 else 0.0
 
     data_ood = data.clone()
-    data_ood.edge_index = edge_index_ood.to(device)
-    if edge_attr_cpu is not None:
-        data_ood.edge_attr = torch.stack(directed_attrs, dim=0).to(device)
-
-    before_vals = list(degree_before.values())
-    after_vals = list(degree_after.values())
-    mean_before = float(np.mean(before_vals)) if before_vals else 0.0
-    mean_after = float(np.mean(after_vals)) if after_vals else 0.0
+    data_ood.edge_index = edge_index_ood
+    data_ood.edge_attr = None
 
     stats = {
-        'selected_nodes': selected_nodes,
-        'num_selected_nodes': int(len(selected_nodes_list)),
-        'selected_ratio': (len(selected_nodes_list) / num_nodes) if num_nodes > 0 else 0.0,
+        'selected_nodes': selected_nodes_cpu,
+        'num_selected_nodes': int(selected_nodes.numel()),
+        'selected_ratio': float(selected_nodes.numel() / num_nodes),
+        'num_edges_before': int(edge_index.size(1)),
+        'num_edges_after': int(edge_index_ood.size(1)),
         'rewired_edges': int(total_rewired),
         'max_rewired_per_node': int(max(rewired_per_node.values(), default=0)),
         'mean_degree_before': mean_before,
         'mean_degree_after': mean_after,
         'degree_change': degree_change,
+        'degree_change_summary': {
+            'mean': change_mean,
+            'std': change_std,
+            'max_abs': change_max_abs,
+        },
     }
     return data_ood, stats
 
